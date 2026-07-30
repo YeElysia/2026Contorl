@@ -166,7 +166,8 @@ void startCurrentStage()
     switch (stage)
     {
     case TestStage::TravelPreparation:
-        accepted = mechanism.prepareForTravel();
+        accepted = mechanism.prepareForTravel(
+            TravelDestination::Material);
         break;
 
     case TestStage::CollectMaterial:
@@ -246,7 +247,13 @@ void updateTestSequence()
     if (travelAfterStationPending)
     {
         travelAfterStationPending = false;
-        if (!mechanism.prepareForTravel())
+        TravelDestination destination = TravelDestination::Home;
+        if (stage == TestStage::CollectMaterial)
+            destination = TravelDestination::RoughProcessing;
+        else if (stage == TestStage::RoughProcessing)
+            destination = TravelDestination::Storage;
+
+        if (!mechanism.prepareForTravel(destination))
         {
             testFault = true;
             actionActive = false;
