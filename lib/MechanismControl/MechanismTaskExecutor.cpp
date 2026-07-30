@@ -127,7 +127,7 @@ bool MechanismTaskExecutor::start(
         _phase = TaskPhase::RoughPlacing;
         loadStorageToRingAction(
             1,
-            _batch.roughPositions[0],
+            ROUGH_RING_POSES[_batch.roughPositions[0]],
             0);
         break;
 
@@ -135,7 +135,8 @@ bool MechanismTaskExecutor::start(
         _phase = TaskPhase::FinalStoring;
         loadStorageToRingAction(
             1,
-            _batch.storagePositions[0],
+            FINAL_STORAGE_RING_POSES[
+                _batch.storagePositions[0]],
             _round);
         break;
     }
@@ -251,8 +252,8 @@ void MechanismTaskExecutor::addSafeRetraction(float baseTarget)
 void MechanismTaskExecutor::addStorageDeposit()
 {
     // 底座已经进入车内方向后，按固定安全顺序将物料放回载物盘。
-    addStep(StepKind::Extend, EXTENSION_STORAGE);
-    addStep(StepKind::Lift, LIFT_STORAGE);
+    addStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
+    addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
     addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
     addStep(StepKind::Lift, LIFT_HOME);
 }
@@ -262,7 +263,7 @@ void MechanismTaskExecutor::loadHomeAction()
     clearAction();
 
     addSafeRetraction(BASE_HOME);
-    addConcurrentStep(StepKind::RotateStorage, STORAGE_ANGLE[0]);
+    addConcurrentStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[0]);
     addConcurrentStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 }
 
@@ -272,7 +273,7 @@ void MechanismTaskExecutor::loadInitializationAction()
     addStep(StepKind::Lift, LIFT_INITIAL);
     addConcurrentStep(StepKind::RotateBase, BASE_INITIAL);
     addConcurrentStep(StepKind::Extend, EXTENSION_INITIAL);
-    addConcurrentStep(StepKind::RotateStorage, STORAGE_ANGLE[0]);
+    addConcurrentStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[0]);
     addConcurrentStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 }
 
@@ -286,7 +287,9 @@ void MechanismTaskExecutor::loadTurntablePreparationAction(uint8_t traySlot)
      */
     addStep(StepKind::Lift, LIFT_HOME);
     addConcurrentStep(StepKind::RotateBase, BASE_TURNTABLE);
-    addConcurrentStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot]);
+    addConcurrentStep(
+        StepKind::RotateStorage,
+        TRAY_SLOT_ANGLE[traySlot]);
     addConcurrentStep(StepKind::OpenGripperMax, GRIPPER_OPEN_MAX_ANGLE);
 
     // 底座进入转盘方向后再伸出，避免长臂扫过车体结构。
@@ -299,7 +302,7 @@ void MechanismTaskExecutor::loadTurntablePickupToStorageAction()
     addStep(StepKind::Lift, LIFT_TURNTABLE);
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 
-    addSafeRetraction(BASE_STORAGE);
+    addSafeRetraction(BASE_TRAY_TRANSFER);
     addStorageDeposit();
 }
 
@@ -464,45 +467,53 @@ void MechanismTaskExecutor::updatePickupAlignment()
 
 void MechanismTaskExecutor::loadStorageToRingAction(
     uint8_t traySlot,
-    uint8_t ring,
+    const RingPose &pose,
     uint8_t stackLevel)
 {
     clearAction();
     // 车内取料准备互不干涉，载物盘、底座、伸缩轴和夹爪同时动作。
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot]);
-    addConcurrentStep(StepKind::RotateBase, BASE_STORAGE);
-    addConcurrentStep(StepKind::Extend, EXTENSION_STORAGE);
+    addStep(
+        StepKind::RotateStorage,
+        TRAY_SLOT_ANGLE[traySlot]);
+    addConcurrentStep(
+        StepKind::RotateBase,
+        BASE_TRAY_TRANSFER);
+    addConcurrentStep(
+        StepKind::Extend,
+        EXTENSION_TRAY_TRANSFER);
     addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
-    addStep(StepKind::Lift, LIFT_STORAGE);
+    addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 
-    addSafeRetraction(RING_BASE_ANGLE[ring]);
+    addSafeRetraction(pose.base);
 
     // 底座到达圆环方向后才允许伸出长臂。
-    addStep(StepKind::Extend, RING_EXTENSION[ring]);
+    addStep(StepKind::Extend, pose.extension);
     addStep(
         StepKind::Lift,
-        LIFT_GROUND - stackLevel * MATERIAL_HEIGHT);
+        pose.lift - stackLevel * MATERIAL_HEIGHT);
     addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
 
-    addSafeRetraction(BASE_STORAGE);
+    addSafeRetraction(BASE_TRAY_TRANSFER);
 }
 
 void MechanismTaskExecutor::loadRingToStorageAction(
     uint8_t traySlot,
-    uint8_t ring)
+    const RingPose &pose)
 {
     clearAction();
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot]);
-    addConcurrentStep(StepKind::RotateBase, RING_BASE_ANGLE[ring]);
+    addStep(
+        StepKind::RotateStorage,
+        TRAY_SLOT_ANGLE[traySlot]);
+    addConcurrentStep(StepKind::RotateBase, pose.base);
     addConcurrentStep(StepKind::OpenGripperMax, GRIPPER_OPEN_MAX_ANGLE);
 
     // 底座到达圆环方向后再伸出。
-    addStep(StepKind::Extend, RING_EXTENSION[ring]);
-    addStep(StepKind::Lift, LIFT_GROUND);
+    addStep(StepKind::Extend, pose.extension);
+    addStep(StepKind::Lift, pose.lift);
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 
-    addSafeRetraction(BASE_STORAGE);
+    addSafeRetraction(BASE_TRAY_TRANSFER);
     addStorageDeposit();
 }
 
@@ -837,7 +848,8 @@ void MechanismTaskExecutor::onActionCompleted()
         {
             loadStorageToRingAction(
                 _itemIndex + 1,
-                _batch.roughPositions[_itemIndex],
+                ROUGH_RING_POSES[
+                    _batch.roughPositions[_itemIndex]],
                 0);
         }
         else
@@ -846,7 +858,8 @@ void MechanismTaskExecutor::onActionCompleted()
             _phase = TaskPhase::RoughRetrieving;
             loadRingToStorageAction(
                 1,
-                _batch.roughPositions[0]);
+                ROUGH_RING_POSES[
+                    _batch.roughPositions[0]]);
         }
         break;
 
@@ -855,7 +868,8 @@ void MechanismTaskExecutor::onActionCompleted()
         {
             loadRingToStorageAction(
                 _itemIndex + 1,
-                _batch.roughPositions[_itemIndex]);
+                ROUGH_RING_POSES[
+                    _batch.roughPositions[_itemIndex]]);
         }
         else
         {
@@ -868,7 +882,8 @@ void MechanismTaskExecutor::onActionCompleted()
         {
             loadStorageToRingAction(
                 _itemIndex + 1,
-                _batch.storagePositions[_itemIndex],
+                FINAL_STORAGE_RING_POSES[
+                    _batch.storagePositions[_itemIndex]],
                 _round);
         }
         else

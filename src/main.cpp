@@ -4,9 +4,9 @@
 #include "ChassisControl.h"
 #include "MissionController.h"
 #include "MaixProGraspVision.h"
+#include "MaixProRingAlignment.h"
 #include "MechanismTaskExecutor.h"
 #include "NextionMissionDisplay.h"
-#include "PassThroughAlignmentProvider.h"
 #include "QRCodeMissionProvider.h"
 #include "RouteExecutor.h"
 #include "chassis_config.h"
@@ -41,17 +41,13 @@ namespace
     ChassisControl chassis(&serialImu);
     RouteExecutor routeExecutor(chassis);
 
-    /*
-     * 扫码已经接入真实GM75数据提供者。
-     * 原料抓取已接入MaixPro视觉闭环；粗加工区和暂存区的整车
-     * 到站对准仍使用占位服务，后续可独立替换。
-     */
     QRCodeMissionProvider missionData(
         serialQr,
         mission_config::QR_BAUD,
         mission_config::QR_TIMEOUT_MS);
-    PassThroughAlignmentProvider alignment;
-    MaixProGraspVision graspVision(serialVision);
+    maixcam::MaixCamV2 camera(serialVision);
+    MaixProGraspVision graspVision(camera);
+    MaixProRingAlignment alignment(camera, chassis);
     MechanismTaskExecutor stationTask(
         serialMechanismStepper,
         serialMechanismBase,
@@ -109,6 +105,7 @@ void setup()
     startButton.attachClick(onStartButtonClicked);
 
     chassis.begin();
+    camera.begin(vision_config::BAUD);
     missionData.begin();
     mission.begin(mission_config::STARTUP_STABLE_MS);
     stationTask.begin();

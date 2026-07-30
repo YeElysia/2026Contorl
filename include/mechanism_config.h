@@ -70,7 +70,7 @@ namespace mechanism_config
      * 载物盘只有三个物料槽。任务可能出现四种颜色中的任意三种，因此
      * 槽位按“本批抓取顺序”分配，而不是把四种颜色固定映射到三个槽。
      */
-    constexpr float STORAGE_ANGLE[4] = {
+    constexpr float TRAY_SLOT_ANGLE[4] = {
         103.0F, // 0：收纳/出发位
         -81.0F, // 1：本批第一个物料
         9.0F,   // 2：本批第二个物料
@@ -85,36 +85,57 @@ namespace mechanism_config
 
     constexpr float LIFT_HOME = 120.0F;
     constexpr float LIFT_TURNTABLE = 410.0F;
-    constexpr float LIFT_GROUND = 1200.0F;
-    constexpr float LIFT_STORAGE = 240.0F;
+    // 机械臂在载物盘处始终使用这一组固定交接坐标。
+    constexpr float LIFT_TRAY_TRANSFER = 240.0F;
     constexpr float MATERIAL_HEIGHT = 700.0F;
 
     // 实车收纳位置：伸缩轴在1500时完全收回。
     constexpr float EXTENSION_HOME = 1540.0F;
     // 从载物盘取放物料时的伸缩位置。
-    constexpr float EXTENSION_STORAGE = 1530.0F;
+    constexpr float EXTENSION_TRAY_TRANSFER = 1530.0F;
     constexpr float EXTENSION_TURNTABLE = 850.0F;
 
     // 工位动作完成后，底座转到180°车内收纳方向。
     constexpr float BASE_HOME = 1800.0F;
     // 从载物盘取放物料时的底座方向。
-    constexpr float BASE_STORAGE = 2760.0F;
+    constexpr float BASE_TRAY_TRANSFER = 2760.0F;
     constexpr float BASE_TURNTABLE = 1800.0F;
 
-    /*
-     * 下标0不用；下标1~3分别对应场地1~3号圆环。
-     * 这里沿用旧项目的三组初值，但语义已从“颜色”改成“圆环编号”。
+    /**
+     * @brief 从底盘统一基准位置到某个圆环的机械臂点位。
+     *
+     * base、lift和extension分别对应底座、升降和伸缩轴的绝对目标值。
+     * 粗加工区视觉只负责把整车对准统一基准，随后不再移动底盘。
      */
-    constexpr float RING_EXTENSION[4] = {
-        0.0F,
-        1200.0F,
-        1200.0F,
-        1200.0F};
-    constexpr float RING_BASE_ANGLE[4] = {
-        BASE_STORAGE,
-        1800.189F,
-        1800.0F,
-        1800.721F};
+    struct RingPose
+    {
+        float base;
+        float lift;
+        float extension;
+    };
+
+    /*
+     * 粗加工区圆环点位表。
+     * 下标0是无效占位；下标1~3直接对应任务码中的1~3号圆环。
+     * 当前先沿用原有初值，现场标定时只修改对应圆环的一行。
+     */
+    constexpr RingPose ROUGH_RING_POSES[4] = {
+        {BASE_TRAY_TRANSFER, 0.0F, 0.0F},
+        {1312.0F, 1200.0F, 1085.0F}, // 1号圆环
+        {1830.0F, 1200.0F, 1500.0F}, // 2号圆环
+        {2278.0F, 1200.0F, 1060.0F}  // 3号圆环
+    };
+
+    /*
+     * 暂存区保持独立标定，避免今后调整粗加工区时影响码垛。
+     * 当前数值与原逻辑一致，后续同样按圆环编号逐行修改。
+     */
+    constexpr RingPose FINAL_STORAGE_RING_POSES[4] = {
+        {BASE_TRAY_TRANSFER, 0.0F, 0.0F},
+        {1800.189F, 1200.0F, 1200.0F}, // 1号圆环
+        {1800.0F, 1200.0F, 1200.0F},   // 2号圆环
+        {1800.721F, 1200.0F, 1200.0F}  // 3号圆环
+    };
 
     // -------------------- 非阻塞执行保护 --------------------
     constexpr uint32_t STEPPER_POLL_MS = 25;

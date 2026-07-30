@@ -11,7 +11,7 @@
 class MaixProGraspVision : public IGraspVisionProvider
 {
 public:
-    explicit MaixProGraspVision(HardwareSerial &serial);
+    explicit MaixProGraspVision(maixcam::MaixCamV2 &camera);
 
     void begin() override;
     bool startTracking(uint8_t color) override;
@@ -21,7 +21,7 @@ public:
     bool faulted() const override;
 
 private:
-    maixcam::MaixCamV2 _camera;
+    maixcam::MaixCamV2 &_camera;
     GraspObservation _observation = {};
     uint8_t _targetColor = 0;
     bool _observationReady = false;

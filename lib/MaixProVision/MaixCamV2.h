@@ -12,6 +12,7 @@ namespace maixcam
 {
 constexpr uint8_t VERSION = 0x01;
 constexpr uint8_t MODE_GRAB = 0xCC;
+constexpr uint8_t MODE_RING = 0xEE;
 constexpr uint8_t MODE_IDLE = 0xFF;
 constexpr uint8_t CMD_SET_TARGET = 0x10;
 constexpr uint8_t CMD_RESET = 0x13;

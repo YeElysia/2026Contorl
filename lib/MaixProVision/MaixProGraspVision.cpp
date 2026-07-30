@@ -2,14 +2,14 @@
 
 #include "vision_config.h"
 
-MaixProGraspVision::MaixProGraspVision(HardwareSerial &serial)
-    : _camera(serial)
+MaixProGraspVision::MaixProGraspVision(
+    maixcam::MaixCamV2 &camera)
+    : _camera(camera)
 {
 }
 
 void MaixProGraspVision::begin()
 {
-    _camera.begin(vision_config::BAUD);
     _begun = true;
     _camera.reset();
     _active = false;
@@ -32,6 +32,10 @@ bool MaixProGraspVision::startTracking(uint8_t color)
 
 void MaixProGraspVision::update()
 {
+    // 未执行抓取时不读取共享相机，避免消费圆环对准器的应答和图像。
+    if (!_active)
+        return;
+
     _camera.poll();
 
     uint8_t command = 0;
@@ -46,7 +50,7 @@ void MaixProGraspVision::update()
     }
 
     maixcam::Detection detection;
-    if (!_active || !_camera.takeDetection(detection))
+    if (!_camera.takeDetection(detection))
         return;
 
     if (detection.mode != maixcam::MODE_GRAB ||

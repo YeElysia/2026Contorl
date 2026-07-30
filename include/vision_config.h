@@ -52,4 +52,22 @@ constexpr float PICKUP_BASE_MIN = 1400.0F;
 constexpr float PICKUP_BASE_MAX = 2200.0F;
 constexpr float PICKUP_EXTENSION_MIN = 300.0F;
 constexpr float PICKUP_EXTENSION_MAX = 1400.0F;
+
+// -------------------- 粗加工区圆环整车对准 --------------------
+// 参考new_project的圆环3定位，后续可按相机视野调整圆环编号。
+constexpr uint8_t ROUGH_RING_ID = 3;
+constexpr int16_t RING_TARGET_DX_PX = 0;
+constexpr int16_t RING_TARGET_DY_PX = 0;
+constexpr int16_t RING_CENTER_TOLERANCE_PX = 10;
+constexpr int16_t RING_FINE_ALIGNMENT_ZONE_PX = 25;
+constexpr uint8_t RING_REQUIRED_STABLE_FRAMES = 3;
+constexpr uint8_t RING_MIN_QUALITY = 30;
+
+// 相机误差到车体坐标：forward>0前进，right>0右移。
+constexpr float RING_FORWARD_MM_PER_DY_PX = 0.8F;
+constexpr float RING_RIGHT_MM_PER_DX_PX = -0.8F;
+constexpr float RING_COARSE_MAX_MOVE_MM = 30.0F;
+constexpr float RING_FINE_MAX_MOVE_MM = 10.0F;
+constexpr uint32_t RING_TARGET_STALE_MS = 500;
+constexpr uint32_t RING_ALIGNMENT_TIMEOUT_MS = 12000;
 } // namespace vision_config

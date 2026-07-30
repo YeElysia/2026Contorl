@@ -6,6 +6,7 @@
 
 #include "GraspVisionPorts.h"
 #include "MissionPorts.h"
+#include "mechanism_config.h"
 
 /**
  * @brief 非阻塞机械臂工位任务执行器。
@@ -135,9 +136,11 @@ private:
     void loadTurntablePickupToStorageAction();
     void loadStorageToRingAction(
         uint8_t traySlot,
-        uint8_t ring,
+        const mechanism_config::RingPose &pose,
         uint8_t stackLevel);
-    void loadRingToStorageAction(uint8_t traySlot, uint8_t ring);
+    void loadRingToStorageAction(
+        uint8_t traySlot,
+        const mechanism_config::RingPose &pose);
 
     bool updateCurrentStep();
     bool updateActionStep(ActionStep &step);
