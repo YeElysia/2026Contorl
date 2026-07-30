@@ -53,11 +53,6 @@ void MechanismTaskExecutor::begin()
         BASE_CONVERT_K,
         BASE_SUBSTEP);
 
-    // 显式初始化查询状态，避免供应商库默认构造值不确定。
-    resetStepperState(_lift);
-    resetStepperState(_extension);
-    resetStepperState(_base);
-
     /*
      * ping用于尽早发现舵机总线接错。仅在setup阶段执行一次，
      * 比赛循环中不使用供应商库的阻塞wait()。
@@ -404,10 +399,14 @@ void MechanismTaskExecutor::updatePickupAlignment()
             _alignmentBaseTarget + baseDelta,
             PICKUP_BASE_MIN,
             PICKUP_BASE_MAX);
-        _base.setAngle(
-            _alignmentBaseTarget,
-            BASE_SPEED,
-            10);
+        if (!_base.setAngle(
+                _alignmentBaseTarget,
+                BASE_SPEED,
+                10))
+        {
+            fail(stepperCommandFaultMessage(_base));
+            return;
+        }
     }
 
     if (abs(errorDy) > CENTER_TOLERANCE_PX)
@@ -416,10 +415,14 @@ void MechanismTaskExecutor::updatePickupAlignment()
             _alignmentExtensionTarget + extensionDelta,
             PICKUP_EXTENSION_MIN,
             PICKUP_EXTENSION_MAX);
-        _extension.runToNewPosition(
-            _alignmentExtensionTarget,
-            EXTENSION_SPEED,
-            10);
+        if (!_extension.runToNewPosition(
+                _alignmentExtensionTarget,
+                EXTENSION_SPEED,
+                10))
+        {
+            fail(stepperCommandFaultMessage(_extension));
+            return;
+        }
     }
 }
 
@@ -484,6 +487,8 @@ bool MechanismTaskExecutor::updateCurrentStep()
         ActionStep &step = _steps[i];
         if (!step.completed)
             step.completed = updateActionStep(step);
+        if (_result == AsyncResult::Failed)
+            return false;
         if (!step.completed)
             groupCompleted = false;
     }
@@ -533,10 +538,18 @@ bool MechanismTaskExecutor::updateStepperStep(
     if (!step.issued)
     {
         resetStepperState(motor);
+        bool commandAccepted = false;
         if (angle)
-            motor.setAngle(step.target);
+            commandAccepted = motor.setAngle(step.target);
         else
-            motor.runToNewPosition(step.target);
+            commandAccepted =
+                motor.runToNewPosition(step.target);
+
+        if (!commandAccepted)
+        {
+            fail(stepperCommandFaultMessage(motor));
+            return false;
+        }
 
         step.issued = true;
         step.startedMs = now;
@@ -863,6 +876,16 @@ const char *MechanismTaskExecutor::stepperFaultMessage(
     return protection
                ? "base stepper protection"
                : "base stepper locked";
+}
+
+const char *MechanismTaskExecutor::stepperCommandFaultMessage(
+    const TTL_Stepper &motor) const
+{
+    if (&motor == &_lift)
+        return "lift stepper command failed";
+    if (&motor == &_extension)
+        return "extension stepper command failed";
+    return "base stepper command failed";
 }
 
 void MechanismTaskExecutor::fail(const char *message)

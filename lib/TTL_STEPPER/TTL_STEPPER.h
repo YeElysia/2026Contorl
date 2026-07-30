@@ -130,10 +130,11 @@ public:
    void init();         // 初始化
    void init(uint8_t addr, TTL_Protocol *protocol);
    void set(uint16_t Speed, uint8_t Acceleration, bool CW, float convert_K, uint16_t substep);
-   void runToNewPosition(float x);
-   void runToNewPosition(float x,uint16_t vel, uint8_t acc);
-   void setAngle(float angle);   // 旋转
-   void setAngle(float angle,uint16_t vel, uint8_t acc);
+   // 命令在有限次数内获得正确应答返回true，否则返回false。
+   bool runToNewPosition(float x);
+   bool runToNewPosition(float x, uint16_t vel, uint8_t acc);
+   bool setAngle(float angle);   // 旋转
+   bool setAngle(float angle, uint16_t vel, uint8_t acc);
    float Calculate_DeltaPos();   // 计算当前位移,更新速度
    float Calculate_CurrentPos(); // 计算当前绝对位置
    void update_CurrentPos();     // 更新当前位置；
@@ -145,6 +146,12 @@ public:
    void Multi_syn_RunToOrigin();   // 多机同步回零
    void recDate_Clear();           // 清空接收区何查询状态标志
 private:
+   static constexpr uint8_t COMMAND_RETRY_COUNT = 3;
+   bool sendPositionCommand(
+      float target,
+      uint16_t velocity,
+      uint8_t acceleration,
+      bool angle);
 };
 class ARM_WHOLE_STEPPER
 {

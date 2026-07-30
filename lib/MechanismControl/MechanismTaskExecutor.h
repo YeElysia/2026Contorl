@@ -159,6 +159,8 @@ private:
     const char *stepperFaultMessage(
         const TTL_Stepper &motor,
         bool protection) const;
+    const char *stepperCommandFaultMessage(
+        const TTL_Stepper &motor) const;
     void fail(const char *message);
 
     static void resetStepperState(TTL_Stepper &motor);

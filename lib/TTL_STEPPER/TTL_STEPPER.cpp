@@ -62,78 +62,83 @@ void TTL_Stepper::set(uint16_t Speed, uint8_t Acceleration, bool CW, float conve
  * @param    x:绝对位置 单位0.1mm
  * @retval
  */
-void TTL_Stepper::runToNewPosition(float x)
+bool TTL_Stepper::runToNewPosition(float x)
 {
-    // 位置模式：（16细分下发送3200个脉冲电机转一圈），绝对运动
-    uint32_t clk = x * substep * 200 * 1.0 / convert_K;
-    do
-    {
-        // currentPosition = previousPosition + Calculate_DeltaPos(); // 更新当前绝对位置和速度
-        // previousPosition = currentPosition;                        // 更新运动开始位置
-        // p_speed=currentSpeed;                                      // 更新运动开始速度
-        protocol->Emm_V5_Pos_Control(this->addr, CW, Speed, Acceleration, clk, 1, 0);
-        //ptime = millis(); // 用于后续更新位移量
-    } while (!wrong_command_catch());
-    //delta = x - previousPosition; // 更新目标位移量
+    return sendPositionCommand(
+        x,
+        Speed,
+        Acceleration,
+        false);
 }
 /**
  * @brief    位置控制，默认不加减速（加速度为0），速度为1000rpm，绝对运动,非多机同步
  * @param    x:绝对位置 单位0.1mm
  * @retval
  */
-void TTL_Stepper::runToNewPosition(float x,uint16_t vel, uint8_t acc)
+bool TTL_Stepper::runToNewPosition(
+    float x,
+    uint16_t vel,
+    uint8_t acc)
 {
-    // 位置模式：速度1000RPM，加速度240，脉冲数（16细分下发送3200个脉冲电机转一圈），绝对运动
-    uint32_t volatile clk = x * substep * 200 * 1.0 / convert_K;
-    do
-    {
-        // currentPosition = previousPosition + Calculate_DeltaPos(); // 更新当前绝对位置和速度
-        // previousPosition = currentPosition;                        // 更新运动开始位置
-        // p_speed=currentSpeed;                                      // 更新运动开始速度
-        protocol->Emm_V5_Pos_Control(this->addr, CW, vel, acc, clk, 1, 0);
-        //ptime = millis(); // 用于后续更新位移量
-    } while (!wrong_command_catch());
-    //delta = x - previousPosition; // 更新目标位移量
+    return sendPositionCommand(x, vel, acc, false);
 }
 /**
  * @brief    设置角度
  * @param    angle:绝对位置角度 单位0.1度
  * @retval
  */
-void TTL_Stepper::setAngle(float angle)
+bool TTL_Stepper::setAngle(float angle)
 {
-    angle=(angle > 3450)? 3450:((angle <0)?0:angle);//限位
-    // 位置模式：速度1000RPM，加速度240，脉冲数（16细分下发送3200个脉冲电机转一圈），绝对运动
-    uint32_t clk = angle * substep * 200 * 1.0 / convert_K;
-    do
-    {
-        // currentPosition = previousPosition + Calculate_DeltaPos(); // 更新当前绝对位置和速度
-        // previousPosition = currentPosition;                        // 更新运动开始位置
-        // p_speed=currentSpeed;                                      // 更新运动开始速度
-        protocol->Emm_V5_Pos_Control(this->addr, CW, Speed, Acceleration, clk, 1, 0);
-        //ptime = millis(); // 用于后续更新位移量
-    } while (!wrong_command_catch());
-    //delta = x - previousPosition; // 更新目标位移量
+    return sendPositionCommand(
+        angle,
+        Speed,
+        Acceleration,
+        true);
 }
 /**
  * @brief    设置角度
  * @param    angle:绝对位置角度 单位0.1度
  * @retval
  */
-void TTL_Stepper::setAngle(float angle,uint16_t vel, uint8_t acc)
+bool TTL_Stepper::setAngle(
+    float angle,
+    uint16_t vel,
+    uint8_t acc)
 {
-    angle=(angle > 3450)? 3450:((angle <0)?0:angle);//限位
-    // 位置模式：速度1000RPM，加速度240，脉冲数（16细分下发送3200个脉冲电机转一圈），绝对运动
-    uint32_t clk = angle * substep * 200 * 1.0 / convert_K;
-    do
+    return sendPositionCommand(angle, vel, acc, true);
+}
+
+bool TTL_Stepper::sendPositionCommand(
+    float target,
+    uint16_t velocity,
+    uint8_t acceleration,
+    bool angle)
+{
+    if (angle)
+        target = constrain(target, 0.0F, 3450.0F);
+
+    // 绝对位置模式；16细分时3200脉冲对应电机一圈。
+    const uint32_t pulses =
+        target * substep * 200.0F / convert_K;
+
+    for (uint8_t attempt = 0;
+         attempt < COMMAND_RETRY_COUNT;
+         ++attempt)
     {
-        // currentPosition = previousPosition + Calculate_DeltaPos(); // 更新当前绝对位置和速度
-        // previousPosition = currentPosition;                        // 更新运动开始位置
-        // p_speed=currentSpeed;                                      // 更新运动开始速度
-        protocol->Emm_V5_Pos_Control(this->addr, CW, vel, acc, clk, 1, 0);
-        //ptime = millis(); // 用于后续更新位移量
-    } while (!wrong_command_catch());
-    //delta = x - previousPosition; // 更新目标位移量
+        protocol->Emm_V5_Pos_Control(
+            addr,
+            CW,
+            velocity,
+            acceleration,
+            pulses,
+            true,
+            false);
+
+        if (wrong_command_catch())
+            return true;
+    }
+
+    return false;
 }
 /**
  * @brief    命令回零（向上）,采用多圈无限位碰撞回零，非多机同步
@@ -466,7 +471,8 @@ void TTL_Stepper::recDate_Clear()
 int TTL_Stepper::Emm_V5_Origin_Read_state()
 {
     uint8_t cmd[3] = {0};
-    uint8_t *rxCmd, *rxCount;
+    uint8_t rxCmd[256] = {};
+    uint8_t rxCount = 0;
     protocol->emptyCache();
     // 装载命令
     cmd[0] = addr; // 地址
@@ -476,8 +482,8 @@ int TTL_Stepper::Emm_V5_Origin_Read_state()
     // 发送命令
     protocol->serial->write(cmd, 3);
     delay(500);
-    protocol->Emm_V5_Receive_Data(rxCmd, rxCount); // 返回数据接收函数
-    for (int i = 0; i <= *rxCount - 4; i++)
+    protocol->Emm_V5_Receive_Data(rxCmd, &rxCount);
+    for (uint16_t i = 0; i + 3 < rxCount; ++i)
     {
         if (rxCmd[i] == this->addr)
         {
@@ -976,18 +982,18 @@ void TTL_Protocol::synrun()
  */
 uint8_t TTL_Protocol::error_address_catch()
 {
-    uint8_t *rxCmd;
-    uint8_t rxCount;
+    uint8_t rxCmd[256] = {};
+    uint8_t rxCount = 0;
     this->Emm_V5_Receive_Data(rxCmd, &rxCount);
-    for(int i=0;i<=rxCount-4;i++){
+    for (uint16_t i = 0; i + 3 < rxCount; ++i) {
         if(rxCmd[i+3]!=0x6B){
             continue;
         }
         if(rxCmd[i+1]==0x00 && rxCmd[i+2]==0xEE){
-            return rxCmd[0];
+            return rxCmd[i];
         }
         else if(rxCmd[i+1]==0xFD && rxCmd[i+2]==0xE2){
-            return rxCmd[0];
+            return rxCmd[i];
         }
         else if(rxCmd[i+2]==0x02){//正确命令
             return 255;
