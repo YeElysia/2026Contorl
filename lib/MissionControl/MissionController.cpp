@@ -172,8 +172,13 @@ void MissionController::updateRouteState()
         onRouteCompleted();
         break;
     case AsyncResult::Failed:
-        fail("chassis route failed");
+    {
+        const char *message = _route.faultMessage();
+        fail(message && message[0]
+                 ? message
+                 : "chassis route failed");
         break;
+    }
     default:
         break;
     }

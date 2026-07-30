@@ -136,7 +136,9 @@ private:
 
     Pose2D _worldPose = {0.0F, 0.0F, 0.0F};
     float _worldYawOffsetDeg = 0.0F;
+    // 世界航向可由resetWorldPose预先给定；IMU零偏必须等首帧后建立。
     bool _worldYawReady = false;
+    bool _worldYawOffsetReady = false;
     long _lastOdometrySteps[4] = {};
 
     float _holdYawDeg = 0.0f;

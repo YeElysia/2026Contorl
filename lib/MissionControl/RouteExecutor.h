@@ -92,6 +92,7 @@ public:
     void cancel();
 
     AsyncResult result() const;
+    const char *faultMessage() const;
 
 private:
     ChassisControl &_chassis;

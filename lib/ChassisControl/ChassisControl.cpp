@@ -39,6 +39,7 @@ void ChassisControl::begin()
     _worldPose = {0.0F, 0.0F, 0.0F};
     _worldYawOffsetDeg = 0.0F;
     _worldYawReady = false;
+    _worldYawOffsetReady = false;
     _state = State::Idle;
 }
 
@@ -211,7 +212,7 @@ bool ChassisControl::rotateTo(float absoluteYawDeg)
 {
     if (busy() || _state == State::Fault)
         return false;
-    if (!_imuReady)
+    if (!imuReady())
     {
         setFault("rotate rejected: IMU not ready");
         return false;
@@ -226,9 +227,9 @@ bool ChassisControl::rotateTo(float absoluteYawDeg)
 
 bool ChassisControl::rotateWorldTo(float worldYawDeg)
 {
-    if (!_worldYawReady)
+    if (!_worldYawOffsetReady)
     {
-        setFault("world rotate rejected: pose yaw not ready");
+        setFault("world rotate rejected: IMU yaw not ready");
         return false;
     }
 
@@ -297,15 +298,21 @@ bool ChassisControl::resetWorldPose(
     _worldPose.yMm = worldYmm;
     _worldPose.yawDeg = wrap180(worldYawDeg);
 
-    if (_imuReady)
+    if (imuReady())
     {
         _worldYawOffsetDeg =
             wrap180(_yawDeg - _worldPose.yawDeg);
         _worldYawReady = true;
+        _worldYawOffsetReady = true;
     }
     else
     {
-        _worldYawReady = false;
+        /*
+         * 调用方已经明确给出了世界航向，可以立即执行首段平移。
+         * IMU零偏仍等待第一帧再建立，旋转动作不会提前放行。
+         */
+        _worldYawReady = true;
+        _worldYawOffsetReady = false;
     }
 
     for (uint8_t i = 0; i < 4; ++i)
@@ -349,12 +356,13 @@ bool ChassisControl::updateImu()
             _yawDeg = rawYaw / 32768.0f * 180.0f;
             _lastImuMs = millis();
             _imuReady = true;
-            if (!_worldYawReady)
+            if (!_worldYawOffsetReady)
             {
                 _worldYawOffsetDeg =
                     wrap180(_yawDeg - _worldPose.yawDeg);
-                _worldYawReady = true;
+                _worldYawOffsetReady = true;
             }
+            _worldYawReady = true;
             _worldPose.yawDeg =
                 wrap180(_yawDeg - _worldYawOffsetDeg);
             updated = true;

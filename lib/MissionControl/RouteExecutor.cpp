@@ -99,3 +99,8 @@ AsyncResult RouteExecutor::result() const
 {
     return _result;
 }
+
+const char *RouteExecutor::faultMessage() const
+{
+    return _chassis.faultMessage();
+}
