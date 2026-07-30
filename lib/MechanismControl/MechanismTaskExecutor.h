@@ -107,7 +107,7 @@ private:
     uint32_t _lastSharedBusPollMs = 0;
     uint32_t _alignmentStartedMs = 0;
     uint32_t _lastObservationMs = 0;
-    uint32_t _lastAlignmentCommandMs = 0;
+    uint32_t _alignmentObservationAfterMs = 0;
     uint8_t _stableFrames = 0;
     float _alignmentBaseTarget = 0.0F;
     float _alignmentExtensionTarget = 0.0F;

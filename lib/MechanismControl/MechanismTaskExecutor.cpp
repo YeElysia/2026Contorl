@@ -309,7 +309,7 @@ void MechanismTaskExecutor::startPickupAlignment()
     _stableFrames = 0;
     _alignmentStartedMs = millis();
     _lastObservationMs = 0;
-    _lastAlignmentCommandMs = 0;
+    _alignmentObservationAfterMs = _alignmentStartedMs;
     _alignmentBaseTarget = BASE_TURNTABLE;
     _alignmentExtensionTarget = EXTENSION_TURNTABLE;
 
@@ -339,6 +339,22 @@ void MechanismTaskExecutor::updatePickupAlignment()
         return;
     }
 
+    /*
+     * 每次根据图像计算出底座和伸缩目标后，先等待两个电机实际
+     * 到位，再使用到位后的新图像继续精调。这样既能一次大步移动，
+     * 又不会因相机延迟连续累加尚未执行完的修正量。
+     */
+    if (_stepCount > 0)
+    {
+        if (!updateCurrentStep())
+            return;
+
+        clearAction();
+        _alignmentObservationAfterMs = millis();
+        _lastObservationMs = 0;
+        return;
+    }
+
     GraspObservation observation;
     if (!_graspVision.takeObservation(observation))
     {
@@ -347,6 +363,14 @@ void MechanismTaskExecutor::updatePickupAlignment()
         {
             _stableFrames = 0;
         }
+        return;
+    }
+
+    // 丢弃电机运动期间产生的旧图像，只使用到位后的观测。
+    if (static_cast<int32_t>(
+            observation.receivedMs -
+            _alignmentObservationAfterMs) < 0)
+    {
         return;
     }
 
@@ -378,51 +402,63 @@ void MechanismTaskExecutor::updatePickupAlignment()
     }
 
     _stableFrames = 0;
-    if (now - _lastAlignmentCommandMs < ALIGN_INTERVAL_MS)
-        return;
-    _lastAlignmentCommandMs = now;
 
-    float baseDelta = -errorDx * BASE_UNITS_PER_PIXEL;
-    float extensionDelta = errorDy * EXTENSION_UNITS_PER_PIXEL;
+    float baseDelta =
+        BASE_FROM_DX * errorDx +
+        BASE_FROM_DY * errorDy;
+    float extensionDelta =
+        EXTENSION_FROM_DX * errorDx +
+        EXTENSION_FROM_DY * errorDy;
+
+    const bool fineAlignment =
+        abs(errorDx) <= FINE_ALIGNMENT_ZONE_PX &&
+        abs(errorDy) <= FINE_ALIGNMENT_ZONE_PX;
+    const float baseLimit =
+        fineAlignment
+            ? FINE_BASE_MAX_DELTA
+            : COARSE_BASE_MAX_DELTA;
+    const float extensionLimit =
+        fineAlignment
+            ? FINE_EXTENSION_MAX_DELTA
+            : COARSE_EXTENSION_MAX_DELTA;
+
     baseDelta = clampValue(
         baseDelta,
-        -BASE_MAX_DELTA,
-        BASE_MAX_DELTA);
+        -baseLimit,
+        baseLimit);
     extensionDelta = clampValue(
         extensionDelta,
-        -EXTENSION_MAX_DELTA,
-        EXTENSION_MAX_DELTA);
+        -extensionLimit,
+        extensionLimit);
 
-    if (abs(errorDx) > CENTER_TOLERANCE_PX)
+    const float nextBaseTarget = clampValue(
+        _alignmentBaseTarget + baseDelta,
+        PICKUP_BASE_MIN,
+        PICKUP_BASE_MAX);
+    const float nextExtensionTarget = clampValue(
+        _alignmentExtensionTarget + extensionDelta,
+        PICKUP_EXTENSION_MIN,
+        PICKUP_EXTENSION_MAX);
+
+    if (fabsf(nextBaseTarget - _alignmentBaseTarget) > 0.1F)
     {
-        _alignmentBaseTarget = clampValue(
-            _alignmentBaseTarget + baseDelta,
-            PICKUP_BASE_MIN,
-            PICKUP_BASE_MAX);
-        if (!_base.setAngle(
-                _alignmentBaseTarget,
-                BASE_SPEED,
-                10))
-        {
-            fail(stepperCommandFaultMessage(_base));
-            return;
-        }
+        _alignmentBaseTarget = nextBaseTarget;
+        addStep(StepKind::RotateBase, _alignmentBaseTarget);
     }
 
-    if (abs(errorDy) > CENTER_TOLERANCE_PX)
+    if (fabsf(
+            nextExtensionTarget -
+            _alignmentExtensionTarget) > 0.1F)
     {
-        _alignmentExtensionTarget = clampValue(
-            _alignmentExtensionTarget + extensionDelta,
-            PICKUP_EXTENSION_MIN,
-            PICKUP_EXTENSION_MAX);
-        if (!_extension.runToNewPosition(
-                _alignmentExtensionTarget,
-                EXTENSION_SPEED,
-                10))
-        {
-            fail(stepperCommandFaultMessage(_extension));
-            return;
-        }
+        _alignmentExtensionTarget = nextExtensionTarget;
+        if (_stepCount == 0)
+            addStep(
+                StepKind::Extend,
+                _alignmentExtensionTarget);
+        else
+            addConcurrentStep(
+                StepKind::Extend,
+                _alignmentExtensionTarget);
     }
 }
 
