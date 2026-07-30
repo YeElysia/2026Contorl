@@ -77,6 +77,10 @@ private:
         const RouteAction *actions,
         size_t count,
         State routeState);
+    bool startRouteWithTravelPreparation(
+        const RouteAction *actions,
+        size_t count,
+        State routeState);
     bool startAlignment(Station station, State alignmentState);
     bool startStationTask(StationTask task, State taskState);
 

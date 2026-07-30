@@ -95,6 +95,18 @@ const char *MechanismTaskExecutor::faultMessage() const
     return _fault;
 }
 
+bool MechanismTaskExecutor::prepareForTravel()
+{
+    if (!ready() || _result == AsyncResult::Running)
+        return false;
+
+    _result = AsyncResult::Running;
+    _phase = TaskPhase::PreparingForTravel;
+    _fault = "";
+    loadHomeAction();
+    return true;
+}
+
 bool MechanismTaskExecutor::start(
     StationTask task,
     uint8_t round,
@@ -208,10 +220,16 @@ void MechanismTaskExecutor::addStep(
 void MechanismTaskExecutor::loadHomeAction()
 {
     clearAction();
+
+    /*
+     * 载物盘舵机收到命令后会自行转动，因此先发送其目标位置，
+     * 后续升降、伸缩和底座步进动作可与载物盘同时进行。最后的
+     * WaitStorage只在其他轴先完成时补足剩余舵机运动时间。
+     */
+    addStep(StepKind::RotateStorage, STORAGE_ANGLE[0], STORAGE_MOVE_MS);
     addStep(StepKind::Lift, LIFT_HOME);
     addStep(StepKind::Extend, EXTENSION_HOME);
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE, GRIPPER_MOVE_MS);
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[0], STORAGE_MOVE_MS);
     addStep(StepKind::RotateBase, BASE_HOME);
     addStep(StepKind::WaitStorage, 0.0F);
 }
@@ -219,10 +237,10 @@ void MechanismTaskExecutor::loadHomeAction()
 void MechanismTaskExecutor::loadInitializationAction()
 {
     clearAction();
+    addStep(StepKind::RotateStorage, STORAGE_ANGLE[0], STORAGE_MOVE_MS);
     addStep(StepKind::Lift, LIFT_INITIAL);
     addStep(StepKind::Extend, EXTENSION_INITIAL);
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE, GRIPPER_MOVE_MS);
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[0], STORAGE_MOVE_MS);
     addStep(StepKind::RotateBase, BASE_INITIAL);
     addStep(StepKind::WaitStorage, 0.0F);
 }
@@ -230,16 +248,17 @@ void MechanismTaskExecutor::loadInitializationAction()
 void MechanismTaskExecutor::loadTurntablePreparationAction(uint8_t traySlot)
 {
     clearAction();
+
     /*
-     * 到达原料区后优先转动底座。初始化时伸缩轴已经位于安全位置900，
-     * 无需先移动到最终收纳位置1500。若把底座动作排在伸缩动作之后，
-     * 伸缩电机没有返回到位时，底座命令将一直无法发出。
+     * 先启动载物盘，再转动机械臂底座。载物盘舵机与三个步进轴
+     * 相互独立，底座旋转期间载物盘会同步到达本次使用的槽位。
      */
+    addStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot], STORAGE_MOVE_MS);
     addStep(StepKind::Lift, LIFT_HOME);
     addStep(StepKind::RotateBase, BASE_TURNTABLE);
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot], STORAGE_MOVE_MS);
     addStep(StepKind::OpenGripperMax, GRIPPER_OPEN_MAX_ANGLE, GRIPPER_MOVE_MS);
     addStep(StepKind::Extend, EXTENSION_TURNTABLE);
+    addStep(StepKind::WaitStorage, 0.0F);
 }
 
 void MechanismTaskExecutor::loadTurntablePickupToStorageAction()
@@ -548,6 +567,12 @@ void MechanismTaskExecutor::onActionCompleted()
         clearAction();
         break;
 
+    case TaskPhase::PreparingForTravel:
+        _phase = TaskPhase::Idle;
+        _result = AsyncResult::Succeeded;
+        clearAction();
+        break;
+
     case TaskPhase::CollectPreparing:
         startPickupAlignment();
         break;
@@ -560,8 +585,7 @@ void MechanismTaskExecutor::onActionCompleted()
         }
         else
         {
-            _phase = TaskPhase::Homing;
-            loadHomeAction();
+            finishStationTask();
         }
         break;
 
@@ -596,8 +620,7 @@ void MechanismTaskExecutor::onActionCompleted()
         }
         else
         {
-            _phase = TaskPhase::Homing;
-            loadHomeAction();
+            finishStationTask();
         }
         break;
 
@@ -611,21 +634,26 @@ void MechanismTaskExecutor::onActionCompleted()
         }
         else
         {
-            _phase = TaskPhase::Homing;
-            loadHomeAction();
+            finishStationTask();
         }
-        break;
-
-    case TaskPhase::Homing:
-        _phase = TaskPhase::Idle;
-        _result = AsyncResult::Succeeded;
-        clearAction();
         break;
 
     case TaskPhase::Idle:
         fail("unexpected mechanism action completion");
         break;
     }
+}
+
+void MechanismTaskExecutor::finishStationTask()
+{
+    /*
+     * 各动作表在结束前都已将物料放稳并把升降轴抬回安全高度。
+     * 此时即可通知底盘启程；完整收纳由prepareForTravel()在行驶
+     * 期间完成，避免停车等待底座和载物盘回位。
+     */
+    _phase = TaskPhase::Idle;
+    _result = AsyncResult::Succeeded;
+    clearAction();
 }
 
 void MechanismTaskExecutor::fail(const char *message)

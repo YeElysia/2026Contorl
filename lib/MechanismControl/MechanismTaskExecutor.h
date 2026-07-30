@@ -23,14 +23,16 @@ public:
         IGraspVisionProvider &graspVision);
 
     /**
-     * @brief 初始化总线并启动机械臂收纳动作。
+     * @brief 初始化总线并让机构到达上电初始位置。
      *
-     * 收纳动作本身由update异步完成；ready()为true后才允许开始比赛。
+     * 初始化动作由update异步完成；ready()为true后才允许开始比赛。
+     * 按下启动键后，机构会在底盘行驶期间转到运输收纳位置。
      */
     void begin();
 
     bool ready() const override;
     const char *faultMessage() const override;
+    bool prepareForTravel() override;
 
     bool start(
         StationTask task,
@@ -63,13 +65,13 @@ private:
     enum class TaskPhase : uint8_t
     {
         Initializing,
+        PreparingForTravel,
         CollectPreparing,
         CollectAligning,
         CollectDepositing,
         RoughPlacing,
         RoughRetrieving,
         FinalStoring,
-        Homing,
         Idle
     };
 
@@ -130,6 +132,7 @@ private:
     bool updateStepperStep(TTL_Stepper &motor, float target, bool angle);
     void issueServoStep(const ActionStep &step);
     void onActionCompleted();
+    void finishStationTask();
     void fail(const char *message);
 
     static bool validRing(uint8_t ring);

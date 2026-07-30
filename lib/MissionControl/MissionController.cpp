@@ -41,6 +41,18 @@ void MissionController::update()
     _stationTask.update();
     _route.update();
 
+    /*
+     * 机构可能在底盘行驶期间执行收纳动作。此时发生堵转或超时
+     * 也必须立即终止整车任务，不能等到达下一个工位才发现。
+     */
+    if (_state != State::Fault &&
+        _stationTask.result() == AsyncResult::Failed)
+    {
+        const char *message = _stationTask.faultMessage();
+        fail(message && message[0] ? message : "mechanism task failed");
+        return;
+    }
+
     switch (_state)
     {
     case State::Startup:
@@ -129,13 +141,6 @@ const char *MissionController::faultMessage() const
 
 void MissionController::updateStartup()
 {
-    if (_stationTask.result() == AsyncResult::Failed)
-    {
-        const char *message = _stationTask.faultMessage();
-        fail(message && message[0] ? message : "mechanism initialization failed");
-        return;
-    }
-
     if (millis() - _startupStartedMs < _startupDelayMs)
         return;
 
@@ -153,7 +158,10 @@ void MissionController::updateWaitingForStart()
     _startRequested = false;
     _round = 0;
 
-    if (!startRoute(TO_SCAN, countOf(TO_SCAN), State::MovingToScan))
+    if (!startRouteWithTravelPreparation(
+            TO_SCAN,
+            countOf(TO_SCAN),
+            State::MovingToScan))
         fail("failed to start route to scan station");
 }
 
@@ -241,6 +249,27 @@ bool MissionController::startRoute(
     return true;
 }
 
+bool MissionController::startRouteWithTravelPreparation(
+    const RouteAction *actions,
+    size_t count,
+    State routeState)
+{
+    if (!startRoute(actions, count, routeState))
+        return false;
+
+    /*
+     * 路线已经启动后再发机构收纳命令，两者从同一次update开始并行。
+     * 若机构拒绝动作，立即取消刚启动的路线，保持故障处理原子性。
+     */
+    if (!_stationTask.prepareForTravel())
+    {
+        _route.cancel();
+        return false;
+    }
+
+    return true;
+}
+
 bool MissionController::startAlignment(
     Station station,
     State alignmentState)
@@ -303,6 +332,9 @@ void MissionController::onRouteCompleted()
         break;
 
     case State::ReturningHome:
+        // 终点必须同时满足底盘到位和机械臂完成运输收纳。
+        if (_stationTask.result() == AsyncResult::Running)
+            return;
         _state = State::Finished;
         break;
 
@@ -314,6 +346,13 @@ void MissionController::onRouteCompleted()
 
 void MissionController::onAlignmentCompleted()
 {
+    /*
+     * 短路线可能比机械臂收纳更早完成。保持在对准状态等待机构，
+     * 确保绝不会在上一段运输动作尚未完成时启动下一工位动作。
+     */
+    if (_stationTask.result() == AsyncResult::Running)
+        return;
+
     switch (_state)
     {
     case State::AligningMaterial:
@@ -350,7 +389,7 @@ void MissionController::onStationTaskCompleted()
     case State::CollectingMaterial:
         if (_round == 0)
         {
-            if (!startRoute(
+            if (!startRouteWithTravelPreparation(
                     MATERIAL_TO_ROUGH_FIRST,
                     countOf(MATERIAL_TO_ROUGH_FIRST),
                     State::MovingToRoughProcessing))
@@ -358,7 +397,7 @@ void MissionController::onStationTaskCompleted()
         }
         else
         {
-            if (!startRoute(
+            if (!startRouteWithTravelPreparation(
                     MATERIAL_TO_ROUGH_SECOND,
                     countOf(MATERIAL_TO_ROUGH_SECOND),
                     State::MovingToRoughProcessing))
@@ -369,7 +408,7 @@ void MissionController::onStationTaskCompleted()
     case State::RoughProcessing:
         if (_round == 0)
         {
-            if (!startRoute(
+            if (!startRouteWithTravelPreparation(
                     ROUGH_TO_STORAGE_FIRST,
                     countOf(ROUGH_TO_STORAGE_FIRST),
                     State::MovingToStorage))
@@ -377,7 +416,7 @@ void MissionController::onStationTaskCompleted()
         }
         else
         {
-            if (!startRoute(
+            if (!startRouteWithTravelPreparation(
                     ROUGH_TO_STORAGE_SECOND,
                     countOf(ROUGH_TO_STORAGE_SECOND),
                     State::MovingToStorage))
@@ -389,7 +428,7 @@ void MissionController::onStationTaskCompleted()
         if (_round == 0)
         {
             _round = 1;
-            if (!startRoute(
+            if (!startRouteWithTravelPreparation(
                     STORAGE_TO_MATERIAL_SECOND,
                     countOf(STORAGE_TO_MATERIAL_SECOND),
                     State::MovingToMaterial))
@@ -397,7 +436,7 @@ void MissionController::onStationTaskCompleted()
         }
         else
         {
-            if (!startRoute(
+            if (!startRouteWithTravelPreparation(
                     STORAGE_TO_HOME,
                     countOf(STORAGE_TO_HOME),
                     State::ReturningHome))

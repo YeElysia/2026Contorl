@@ -105,6 +105,15 @@ public:
     virtual ~IStationTaskExecutor() = default;
     virtual bool ready() const = 0;
     virtual const char *faultMessage() const = 0;
+
+    /**
+     * @brief 在底盘行驶期间将机构异步收回安全运输位。
+     *
+     * 调用成功只表示动作已经启动，完成状态仍通过result()查询。
+     * 下一工位开始动作前，任务状态机必须等待该动作执行完成。
+     */
+    virtual bool prepareForTravel() = 0;
+
     virtual bool start(
         StationTask task,
         uint8_t round,
