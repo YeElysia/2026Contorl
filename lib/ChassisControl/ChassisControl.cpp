@@ -30,16 +30,22 @@ void ChassisControl::begin()
         motor.setAcceleration(acceleration);
         motor.setCurrentPosition(0);
     }
+    for (uint8_t i = 0; i < 4; ++i)
+        _lastOdometrySteps[i] = _motors[i].currentPosition();
 
     if (_imuSerial != nullptr)
         _imuSerial->begin(IMU_BAUD);
 
+    _worldPose = {0.0F, 0.0F, 0.0F};
+    _worldYawOffsetDeg = 0.0F;
+    _worldYawReady = false;
     _state = State::Idle;
 }
 
 void ChassisControl::update()
 {
     updateImu();
+    updateOdometry();
 
     if (_state != State::Idle &&
         _state != State::Fault &&
@@ -60,9 +66,12 @@ void ChassisControl::update()
     default:
         break;
     }
+
+    // 记录本次run()/runSpeed()实际产生的脉冲，避免位姿落后一轮。
+    updateOdometry();
 }
 
-bool ChassisControl::moveRelative(
+bool ChassisControl::moveBodyRelative(
     float forwardMm,
     float rightMm,
     float maxRpm,
@@ -145,6 +154,40 @@ bool ChassisControl::moveRelative(
     return true;
 }
 
+bool ChassisControl::moveRelative(
+    float forwardMm,
+    float rightMm,
+    float maxRpm,
+    float accelerationRpmPerS)
+{
+    return moveBodyRelative(
+        forwardMm,
+        rightMm,
+        maxRpm,
+        accelerationRpmPerS);
+}
+
+bool ChassisControl::moveWorldRelative(
+    float worldXMm,
+    float worldYMm,
+    float maxRpm,
+    float accelerationRpmPerS)
+{
+    float forwardMm = 0.0F;
+    float rightMm = 0.0F;
+    worldToBody(
+        worldXMm,
+        worldYMm,
+        _worldPose.yawDeg,
+        forwardMm,
+        rightMm);
+    return moveBodyRelative(
+        forwardMm,
+        rightMm,
+        maxRpm,
+        accelerationRpmPerS);
+}
+
 bool ChassisControl::rotateTo(float absoluteYawDeg)
 {
     if (busy() || _state == State::Fault)
@@ -160,6 +203,18 @@ bool ChassisControl::rotateTo(float absoluteYawDeg)
     _motionStartMs = millis();
     _state = State::Rotating;
     return true;
+}
+
+bool ChassisControl::rotateWorldTo(float worldYawDeg)
+{
+    if (!_worldYawReady)
+    {
+        setFault("world rotate rejected: pose yaw not ready");
+        return false;
+    }
+
+    return rotateTo(
+        wrap180(worldYawDeg + _worldYawOffsetDeg));
 }
 
 void ChassisControl::stop()
@@ -206,6 +261,39 @@ float ChassisControl::yawDeg() const
     return _yawDeg;
 }
 
+ChassisControl::Pose2D ChassisControl::worldPose() const
+{
+    return _worldPose;
+}
+
+bool ChassisControl::resetWorldPose(
+    float worldXmm,
+    float worldYmm,
+    float worldYawDeg)
+{
+    if (busy())
+        return false;
+
+    _worldPose.xMm = worldXmm;
+    _worldPose.yMm = worldYmm;
+    _worldPose.yawDeg = wrap180(worldYawDeg);
+
+    if (_imuReady)
+    {
+        _worldYawOffsetDeg =
+            wrap180(_yawDeg - _worldPose.yawDeg);
+        _worldYawReady = true;
+    }
+    else
+    {
+        _worldYawReady = false;
+    }
+
+    for (uint8_t i = 0; i < 4; ++i)
+        _lastOdometrySteps[i] = _motors[i].currentPosition();
+    return true;
+}
+
 const char *ChassisControl::faultMessage() const
 {
     return _fault;
@@ -242,10 +330,61 @@ bool ChassisControl::updateImu()
             _yawDeg = rawYaw / 32768.0f * 180.0f;
             _lastImuMs = millis();
             _imuReady = true;
+            if (!_worldYawReady)
+            {
+                _worldYawOffsetDeg =
+                    wrap180(_yawDeg - _worldPose.yawDeg);
+                _worldYawReady = true;
+            }
+            _worldPose.yawDeg =
+                wrap180(_yawDeg - _worldYawOffsetDeg);
             updated = true;
         }
     }
     return updated;
+}
+
+void ChassisControl::updateOdometry()
+{
+    float wheelMm[4] = {};
+    bool moved = false;
+    for (uint8_t i = 0; i < 4; ++i)
+    {
+        const long current = _motors[i].currentPosition();
+        const long deltaSteps = current - _lastOdometrySteps[i];
+        _lastOdometrySteps[i] = current;
+        wheelMm[i] =
+            static_cast<float>(deltaSteps) /
+            (STEPS_PER_MM * MOTOR_SIGN[i]);
+        moved = moved || deltaSteps != 0;
+    }
+
+    if (!moved)
+        return;
+
+    /*
+     * 麦轮正解算。四轮共同的旋转分量在这两个平移组合中抵消，
+     * 所以旋转由IMU记录，x/y只累计实际产生的平移脉冲。
+     */
+    const float forwardMm =
+        (wheelMm[0] + wheelMm[1] +
+         wheelMm[2] + wheelMm[3]) *
+        0.25F;
+    const float rightMm =
+        (wheelMm[0] - wheelMm[1] -
+         wheelMm[2] + wheelMm[3]) *
+        0.25F;
+
+    float worldXMm = 0.0F;
+    float worldYMm = 0.0F;
+    bodyToWorld(
+        forwardMm,
+        rightMm,
+        _worldPose.yawDeg,
+        worldXMm,
+        worldYMm);
+    _worldPose.xMm += worldXMm;
+    _worldPose.yMm += worldYMm;
 }
 
 void ChassisControl::updateTranslation()
@@ -373,4 +512,36 @@ float ChassisControl::wrap180(float angleDeg)
 float ChassisControl::rpmToStepsPerSecond(float rpm)
 {
     return rpm * STEPS_PER_REV / 60.0f;
+}
+
+void ChassisControl::bodyToWorld(
+    float forwardMm,
+    float rightMm,
+    float yawDeg,
+    float &worldXMm,
+    float &worldYMm)
+{
+    const float radians = yawDeg * PI / 180.0F;
+    const float cosine = cosf(radians);
+    const float sine = sinf(radians);
+    /*
+     * yaw=0时：车体前进对应世界+y，车体向右对应世界-x。
+     * yaw正方向沿用JY901和底盘旋转控制的正方向。
+     */
+    worldXMm = sine * forwardMm - cosine * rightMm;
+    worldYMm = cosine * forwardMm + sine * rightMm;
+}
+
+void ChassisControl::worldToBody(
+    float worldXMm,
+    float worldYMm,
+    float yawDeg,
+    float &forwardMm,
+    float &rightMm)
+{
+    const float radians = yawDeg * PI / 180.0F;
+    const float cosine = cosf(radians);
+    const float sine = sinf(radians);
+    forwardMm = sine * worldXMm + cosine * worldYMm;
+    rightMm = -cosine * worldXMm + sine * worldYMm;
 }

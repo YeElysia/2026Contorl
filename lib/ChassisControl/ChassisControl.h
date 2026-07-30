@@ -6,6 +6,19 @@
 class ChassisControl
 {
 public:
+    /**
+     * @brief 机器人在世界坐标系中的估计位姿。
+     *
+     * 世界原点默认为上电位置：x轴正方向指向初始车体左侧，
+     * y轴正方向指向初始车头，yawDeg为相对初始航向的角度。
+     */
+    struct Pose2D
+    {
+        float xMm;
+        float yMm;
+        float yawDeg;
+    };
+
     enum class State : uint8_t
     {
         Idle,
@@ -39,12 +52,35 @@ public:
      *
      * @return 成功接受命令返回 true；底盘忙碌或处于故障状态返回 false。
      */
+    bool moveBodyRelative(
+        float forwardMm,
+        float rightMm,
+        float maxRpm,
+        float accelerationRpmPerS);
+
+    /**
+     * @brief 兼容现有调用的车体坐标相对移动接口。
+     */
     bool moveRelative(
         float forwardMm,
         float rightMm,
         float maxRpm,
         float accelerationRpmPerS);
+
+    /**
+     * @brief 按世界坐标增量移动（+x向初始左侧，+y向初始车头）。
+     *
+     * 本函数在下发时将世界坐标增量转换为当前车体的前后/左右
+     * 分量，随后仍由同一套麦轮控制和航向保持逻辑执行。
+     */
+    bool moveWorldRelative(
+        float worldXMm,
+        float worldYMm,
+        float maxRpm,
+        float accelerationRpmPerS);
+
     bool rotateTo(float absoluteYawDeg);
+    bool rotateWorldTo(float worldYawDeg);
     void stop();
     void clearFault();
 
@@ -52,7 +88,25 @@ public:
     bool busy() const;
     bool imuReady() const;
     float yawDeg() const;
+    Pose2D worldPose() const;
+    bool resetWorldPose(
+        float worldXmm = 0.0F,
+        float worldYmm = 0.0F,
+        float worldYawDeg = 0.0F);
     const char *faultMessage() const;
+
+    static void bodyToWorld(
+        float forwardMm,
+        float rightMm,
+        float yawDeg,
+        float &worldXMm,
+        float &worldYMm);
+    static void worldToBody(
+        float worldXMm,
+        float worldYMm,
+        float yawDeg,
+        float &forwardMm,
+        float &rightMm);
 
 private:
     HardwareSerial *_imuSerial;
@@ -67,6 +121,11 @@ private:
     bool _imuReady = false;
     uint32_t _lastImuMs = 0;
 
+    Pose2D _worldPose = {0.0F, 0.0F, 0.0F};
+    float _worldYawOffsetDeg = 0.0F;
+    bool _worldYawReady = false;
+    long _lastOdometrySteps[4] = {};
+
     float _holdYawDeg = 0.0f;
     // 当前平移中各轮按行程比例分配的巡航速度。
     // 例如轮子行程为 [700, 300, 300, 700]，速度比例就是
@@ -79,6 +138,7 @@ private:
     uint32_t _motionStartMs = 0;
 
     bool updateImu();
+    void updateOdometry();
     void updateTranslation();
     void updateRotation();
     void setFault(const char *message);

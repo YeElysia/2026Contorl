@@ -157,7 +157,7 @@ void MaixProRingAlignment::update()
         errorDx * RING_RIGHT_MM_PER_DX_PX,
         moveLimit);
 
-    if (!_chassis.moveRelative(
+    if (!_chassis.moveBodyRelative(
             forwardMm,
             rightMm,
             PRECISE_DRIVE_RPM,

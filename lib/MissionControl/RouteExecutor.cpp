@@ -65,7 +65,7 @@ void RouteExecutor::update()
                 chassis_config::PRECISE_DRIVE_ACCEL_RPM_PER_S;
         }
 
-        accepted = _chassis.moveRelative(
+        accepted = _chassis.moveBodyRelative(
             action.forwardMm,
             action.rightMm,
             maximumRpm,
@@ -74,7 +74,7 @@ void RouteExecutor::update()
     }
 
     case RouteActionType::RotateTo:
-        accepted = _chassis.rotateTo(action.yawDeg);
+        accepted = _chassis.rotateWorldTo(action.yawDeg);
         break;
     }
 
