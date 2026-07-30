@@ -221,6 +221,23 @@ void MechanismTaskExecutor::addConcurrentStep(
         return;
     }
 
+    /*
+     * 升降轴与底座旋转轴在机构上不再视为可并行执行。
+     * 即使动作表误用了addConcurrentStep，也自动拆到下一组，
+     * 并保持调用顺序不变。
+     */
+    const bool conflictsWithLift =
+        kind == StepKind::RotateBase &&
+        lastGroupContains(StepKind::Lift);
+    const bool conflictsWithBase =
+        kind == StepKind::Lift &&
+        lastGroupContains(StepKind::RotateBase);
+    if (conflictsWithLift || conflictsWithBase)
+    {
+        addStep(kind, target);
+        return;
+    }
+
     appendStep(
         kind,
         target,
@@ -251,14 +268,31 @@ void MechanismTaskExecutor::appendStep(
         false};
 }
 
+bool MechanismTaskExecutor::lastGroupContains(StepKind kind) const
+{
+    if (_stepCount == 0)
+        return false;
+
+    const uint8_t lastGroup = _steps[_stepCount - 1].group;
+    for (uint8_t i = 0; i < _stepCount; ++i)
+    {
+        if (_steps[i].group == lastGroup &&
+            _steps[i].kind == kind)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 void MechanismTaskExecutor::addSafeRetraction(float baseTarget)
 {
     /*
-     * 用户已确认升降上抬和底座旋转不会互相干涉。保持升降命令
-     * 最先下发，随后让底座转向和伸缩回收在同一动作组中并行。
+     * 先等待升降轴到达安全高度，再允许底座转向。
+     * 底座旋转时可同时回收伸缩轴。
      */
     addStep(StepKind::Lift, LIFT_HOME);
-    addConcurrentStep(StepKind::RotateBase, baseTarget);
+    addStep(StepKind::RotateBase, baseTarget);
     addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
 }
 
@@ -284,7 +318,7 @@ void MechanismTaskExecutor::loadInitializationAction()
 {
     clearAction();
     addStep(StepKind::Lift, LIFT_INITIAL);
-    addConcurrentStep(StepKind::RotateBase, BASE_INITIAL);
+    addStep(StepKind::RotateBase, BASE_INITIAL);
     addConcurrentStep(StepKind::Extend, EXTENSION_INITIAL);
     addConcurrentStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[0]);
     addConcurrentStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
@@ -295,11 +329,11 @@ void MechanismTaskExecutor::loadTurntablePreparationAction(uint8_t traySlot)
     clearAction();
 
     /*
-     * 先发送升降上升命令，再发送底座旋转命令；载物盘和夹爪
-     * 随后启动，四个执行器仍属于同一个并行动作组。
+     * 升降轴必须先独立到达安全高度。随后底座、载物盘和夹爪
+     * 可以并行准备，全部到位后才允许伸出长臂。
      */
     addStep(StepKind::Lift, LIFT_HOME);
-    addConcurrentStep(StepKind::RotateBase, BASE_TURNTABLE);
+    addStep(StepKind::RotateBase, BASE_TURNTABLE);
     addConcurrentStep(
         StepKind::RotateStorage,
         TRAY_SLOT_ANGLE[traySlot]);

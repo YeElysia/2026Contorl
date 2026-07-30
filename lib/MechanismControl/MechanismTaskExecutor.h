@@ -14,6 +14,7 @@
  *
  * 高层只提交“取料/粗加工/码垛”任务。本类把任务展开成基础动作表，
  * 同一动作组中的独立执行器并行运动，动作组之间保持必要的安全顺序。
+ * 升降轴和底座旋转轴禁止进入同一动作组，始终先升降、后旋转。
  * 每次update只下发命令或轮询状态，不使用delay和阻塞wait。
  */
 class MechanismTaskExecutor : public IStationTaskExecutor
@@ -133,6 +134,7 @@ private:
         StepKind kind,
         float target,
         uint8_t group);
+    bool lastGroupContains(StepKind kind) const;
     void addSafeRetraction(float baseTarget);
     void addStorageDeposit();
     void loadInitializationAction();
