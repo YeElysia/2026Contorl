@@ -33,17 +33,11 @@ public:
      *  两个分量可同时给出，从而执行斜向移动。
      *
      *  运动开始时记录当前 IMU 航向，移动过程中自动抑制偏航。
+     *  maxRpm和accelerationRpmPerS分别指定轮子转速与加速度，
+     *  供路线执行器选择快速或精确档。
      *  本函数只下发目标，不阻塞等待；必须在 loop() 中持续调用 update()。
      *
      * @return 成功接受命令返回 true；底盘忙碌或处于故障状态返回 false。
-    */
-    bool moveRelative(float forwardMm, float rightMm);
-
-    /**
-     * @brief 使用指定速度档位执行相对平移。
-     *
-     * maxRpm是轮子最高转速，accelerationRpmPerS是轮子加速度。
-     * 该重载供路线执行器选择快速/精确档，底盘逆解算保持一致。
      */
     bool moveRelative(
         float forwardMm,

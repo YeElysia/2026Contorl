@@ -1,7 +1,5 @@
 #include "MechanismTaskExecutor.h"
 
-#include <string.h>
-
 #include "mechanism_config.h"
 #include "vision_config.h"
 
@@ -56,18 +54,9 @@ void MechanismTaskExecutor::begin()
         BASE_SUBSTEP);
 
     // 显式初始化查询状态，避免供应商库默认构造值不确定。
-    _lift.recDate_Clear();
-    _extension.recDate_Clear();
-    _base.recDate_Clear();
-    _lift.onPos_state = false;
-    _extension.onPos_state = false;
-    _base.onPos_state = false;
-    _lift.locked_state = false;
-    _extension.locked_state = false;
-    _base.locked_state = false;
-    _lift.loPro_state = false;
-    _extension.loPro_state = false;
-    _base.loPro_state = false;
+    resetStepperState(_lift);
+    resetStepperState(_extension);
+    resetStepperState(_base);
 
     /*
      * ping用于尽早发现舵机总线接错。仅在setup阶段执行一次，
@@ -253,17 +242,31 @@ void MechanismTaskExecutor::appendStep(
         false};
 }
 
+void MechanismTaskExecutor::addSafeRetraction(float baseTarget)
+{
+    /*
+     * 用户已确认升降上抬和底座旋转不会互相干涉。保持升降命令
+     * 最先下发，随后让底座转向和伸缩回收在同一动作组中并行。
+     */
+    addStep(StepKind::Lift, LIFT_HOME);
+    addConcurrentStep(StepKind::RotateBase, baseTarget);
+    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+}
+
+void MechanismTaskExecutor::addStorageDeposit()
+{
+    // 底座已经进入车内方向后，按固定安全顺序将物料放回载物盘。
+    addStep(StepKind::Extend, EXTENSION_STORAGE);
+    addStep(StepKind::Lift, LIFT_STORAGE);
+    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
+    addStep(StepKind::Lift, LIFT_HOME);
+}
+
 void MechanismTaskExecutor::loadHomeAction()
 {
     clearAction();
 
-    /*
-     * 同组动作按照加入顺序下发：先让升降轴获得上升命令，再发送
-     * 底座旋转命令。其他执行器随后启动，但整个动作组仍然并行。
-     */
-    addStep(StepKind::Lift, LIFT_HOME);
-    addConcurrentStep(StepKind::RotateBase, BASE_HOME);
-    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+    addSafeRetraction(BASE_HOME);
     addConcurrentStep(StepKind::RotateStorage, STORAGE_ANGLE[0]);
     addConcurrentStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 }
@@ -301,16 +304,8 @@ void MechanismTaskExecutor::loadTurntablePickupToStorageAction()
     addStep(StepKind::Lift, LIFT_TURNTABLE);
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 
-    // 夹紧后先发送上升命令，再让底座同步转向车内载物盘。
-    addStep(StepKind::Lift, LIFT_HOME);
-    addConcurrentStep(StepKind::RotateBase, BASE_STORAGE);
-    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
-
-    // 底座到达车内方向后再进入精确的载物盘伸缩位置。
-    addStep(StepKind::Extend, EXTENSION_STORAGE);
-    addStep(StepKind::Lift, LIFT_STORAGE);
-    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
-    addStep(StepKind::Lift, LIFT_HOME);
+    addSafeRetraction(BASE_STORAGE);
+    addStorageDeposit();
 }
 
 void MechanismTaskExecutor::startPickupAlignment()
@@ -442,13 +437,7 @@ void MechanismTaskExecutor::loadStorageToRingAction(
     addStep(StepKind::Lift, LIFT_STORAGE);
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 
-    /*
-     * 物料夹紧后，升降轴上抬、伸缩轴回收和底座转向圆环可并行。
-     * 用户已确认底座旋转与升降抬升不存在机械干涉。
-     */
-    addStep(StepKind::Lift, LIFT_HOME);
-    addConcurrentStep(StepKind::RotateBase, RING_BASE_ANGLE[ring]);
-    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+    addSafeRetraction(RING_BASE_ANGLE[ring]);
 
     // 底座到达圆环方向后才允许伸出长臂。
     addStep(StepKind::Extend, RING_EXTENSION[ring]);
@@ -457,10 +446,7 @@ void MechanismTaskExecutor::loadStorageToRingAction(
         LIFT_GROUND - stackLevel * MATERIAL_HEIGHT);
     addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
 
-    // 离开圆环时三个步进轴同时回到安全运输方向。
-    addStep(StepKind::Lift, LIFT_HOME);
-    addConcurrentStep(StepKind::RotateBase, BASE_STORAGE);
-    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+    addSafeRetraction(BASE_STORAGE);
 }
 
 void MechanismTaskExecutor::loadRingToStorageAction(
@@ -477,16 +463,8 @@ void MechanismTaskExecutor::loadRingToStorageAction(
     addStep(StepKind::Lift, LIFT_GROUND);
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 
-    // 从圆环抬起时同步回收长臂并转向车内载物盘。
-    addStep(StepKind::Lift, LIFT_HOME);
-    addConcurrentStep(StepKind::RotateBase, BASE_STORAGE);
-    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
-
-    // 确认底座已进入车内方向后再移动到载物盘取放位置。
-    addStep(StepKind::Extend, EXTENSION_STORAGE);
-    addStep(StepKind::Lift, LIFT_STORAGE);
-    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
-    addStep(StepKind::Lift, LIFT_HOME);
+    addSafeRetraction(BASE_STORAGE);
+    addStorageDeposit();
 }
 
 bool MechanismTaskExecutor::updateCurrentStep()
@@ -554,10 +532,7 @@ bool MechanismTaskExecutor::updateStepperStep(
     const uint32_t now = millis();
     if (!step.issued)
     {
-        motor.recDate_Clear();
-        motor.onPos_state = false;
-        motor.locked_state = false;
-        motor.loPro_state = false;
+        resetStepperState(motor);
         if (angle)
             motor.setAngle(step.target);
         else
@@ -903,6 +878,14 @@ void MechanismTaskExecutor::fail(const char *message)
     _phase = TaskPhase::Idle;
     _result = AsyncResult::Failed;
     clearAction();
+}
+
+void MechanismTaskExecutor::resetStepperState(TTL_Stepper &motor)
+{
+    motor.recDate_Clear();
+    motor.onPos_state = false;
+    motor.locked_state = false;
+    motor.loPro_state = false;
 }
 
 bool MechanismTaskExecutor::validRing(uint8_t ring)

@@ -31,6 +31,19 @@ struct RouteAction
     MotionProfile profile;
 };
 
+struct RouteDefinition
+{
+    const RouteAction *actions;
+    size_t count;
+};
+
+template <size_t N>
+constexpr RouteDefinition routeDefinition(
+    const RouteAction (&actions)[N])
+{
+    return {actions, N};
+}
+
 constexpr RouteAction routeMove(float forwardMm, float rightMm)
 {
     return {
@@ -74,12 +87,11 @@ class RouteExecutor
 public:
     explicit RouteExecutor(ChassisControl &chassis);
 
-    bool start(const RouteAction *actions, size_t count);
+    bool start(RouteDefinition route);
     void update();
     void cancel();
 
     AsyncResult result() const;
-    size_t actionIndex() const;
 
 private:
     ChassisControl &_chassis;

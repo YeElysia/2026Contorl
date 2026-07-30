@@ -25,7 +25,6 @@ void NextionMissionDisplay::begin(
      * 到时后update()会自动刷新当前任务状态。
      */
     _screenReadyMs = millis() + restartWaitMs;
-    _initialized = false;
     _lastState = static_cast<MissionController::State>(0xFF);
     _lastQrText[0] = '\0';
 }
@@ -34,14 +33,6 @@ void NextionMissionDisplay::update()
 {
     if (static_cast<int32_t>(millis() - _screenReadyMs) < 0)
         return;
-
-    if (!_initialized)
-    {
-        _initialized = true;
-        updateState();
-        updateQrText();
-        return;
-    }
 
     updateState();
     updateQrText();

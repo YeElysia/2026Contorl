@@ -31,7 +31,6 @@ private:
         static_cast<MissionController::State>(0xFF);
     char _lastQrText[16] = {};
     uint32_t _screenReadyMs = 0;
-    bool _initialized = false;
 
     void updateState();
     void updateQrText();

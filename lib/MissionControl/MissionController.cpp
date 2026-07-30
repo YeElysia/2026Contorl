@@ -159,8 +159,7 @@ void MissionController::updateWaitingForStart()
     _round = 0;
 
     if (!startRouteWithTravelPreparation(
-            TO_SCAN,
-            countOf(TO_SCAN),
+            ROUTE_TO_SCAN,
             State::MovingToScan))
         fail("failed to start route to scan station");
 }
@@ -187,8 +186,7 @@ void MissionController::updateScanning()
     case AsyncResult::Succeeded:
         _plan = _missionData.plan();
         if (!startRoute(
-                SCAN_TO_MATERIAL,
-                countOf(SCAN_TO_MATERIAL),
+                ROUTE_SCAN_TO_MATERIAL,
                 State::MovingToMaterial))
         {
             fail("failed to start route to material station");
@@ -226,23 +224,16 @@ void MissionController::updateStationTaskState()
     case AsyncResult::Succeeded:
         onStationTaskCompleted();
         break;
-    case AsyncResult::Failed:
-    {
-        const char *message = _stationTask.faultMessage();
-        fail(message && message[0] ? message : "station mechanism task failed");
-        break;
-    }
     default:
         break;
     }
 }
 
 bool MissionController::startRoute(
-    const RouteAction *actions,
-    size_t count,
+    RouteDefinition route,
     State routeState)
 {
-    if (!_route.start(actions, count))
+    if (!_route.start(route))
         return false;
 
     _state = routeState;
@@ -250,11 +241,10 @@ bool MissionController::startRoute(
 }
 
 bool MissionController::startRouteWithTravelPreparation(
-    const RouteAction *actions,
-    size_t count,
+    RouteDefinition route,
     State routeState)
 {
-    if (!startRoute(actions, count, routeState))
+    if (!startRoute(route, routeState))
         return false;
 
     /*
@@ -387,41 +377,17 @@ void MissionController::onStationTaskCompleted()
     switch (_state)
     {
     case State::CollectingMaterial:
-        if (_round == 0)
-        {
-            if (!startRouteWithTravelPreparation(
-                    MATERIAL_TO_ROUGH_FIRST,
-                    countOf(MATERIAL_TO_ROUGH_FIRST),
-                    State::MovingToRoughProcessing))
-                fail("failed to leave first material task");
-        }
-        else
-        {
-            if (!startRouteWithTravelPreparation(
-                    MATERIAL_TO_ROUGH_SECOND,
-                    countOf(MATERIAL_TO_ROUGH_SECOND),
-                    State::MovingToRoughProcessing))
-                fail("failed to leave second material task");
-        }
+        if (!startRouteWithTravelPreparation(
+                ROUTE_MATERIAL_TO_ROUGH[_round],
+                State::MovingToRoughProcessing))
+            fail("failed to leave material task");
         break;
 
     case State::RoughProcessing:
-        if (_round == 0)
-        {
-            if (!startRouteWithTravelPreparation(
-                    ROUGH_TO_STORAGE_FIRST,
-                    countOf(ROUGH_TO_STORAGE_FIRST),
-                    State::MovingToStorage))
-                fail("failed to leave first rough-process task");
-        }
-        else
-        {
-            if (!startRouteWithTravelPreparation(
-                    ROUGH_TO_STORAGE_SECOND,
-                    countOf(ROUGH_TO_STORAGE_SECOND),
-                    State::MovingToStorage))
-                fail("failed to leave second rough-process task");
-        }
+        if (!startRouteWithTravelPreparation(
+                ROUTE_ROUGH_TO_STORAGE[_round],
+                State::MovingToStorage))
+            fail("failed to leave rough-process task");
         break;
 
     case State::StoringFinishedProduct:
@@ -429,16 +395,14 @@ void MissionController::onStationTaskCompleted()
         {
             _round = 1;
             if (!startRouteWithTravelPreparation(
-                    STORAGE_TO_MATERIAL_SECOND,
-                    countOf(STORAGE_TO_MATERIAL_SECOND),
+                    ROUTE_STORAGE_TO_MATERIAL_SECOND,
                     State::MovingToMaterial))
                 fail("failed to start second round");
         }
         else
         {
             if (!startRouteWithTravelPreparation(
-                    STORAGE_TO_HOME,
-                    countOf(STORAGE_TO_HOME),
+                    ROUTE_STORAGE_TO_HOME,
                     State::ReturningHome))
                 fail("failed to start return-home route");
         }

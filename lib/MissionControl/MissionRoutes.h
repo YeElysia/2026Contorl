@@ -75,9 +75,17 @@ constexpr RouteAction STORAGE_TO_HOME[] = {
     routePreciseMove(240.0f, 0.0f),
 };
 
-template <size_t N>
-constexpr size_t countOf(const RouteAction (&)[N])
-{
-    return N;
-}
+constexpr RouteDefinition ROUTE_TO_SCAN = routeDefinition(TO_SCAN);
+constexpr RouteDefinition ROUTE_SCAN_TO_MATERIAL =
+    routeDefinition(SCAN_TO_MATERIAL);
+constexpr RouteDefinition ROUTE_MATERIAL_TO_ROUGH[BATCH_COUNT] = {
+    routeDefinition(MATERIAL_TO_ROUGH_FIRST),
+    routeDefinition(MATERIAL_TO_ROUGH_SECOND)};
+constexpr RouteDefinition ROUTE_ROUGH_TO_STORAGE[BATCH_COUNT] = {
+    routeDefinition(ROUGH_TO_STORAGE_FIRST),
+    routeDefinition(ROUGH_TO_STORAGE_SECOND)};
+constexpr RouteDefinition ROUTE_STORAGE_TO_MATERIAL_SECOND =
+    routeDefinition(STORAGE_TO_MATERIAL_SECOND);
+constexpr RouteDefinition ROUTE_STORAGE_TO_HOME =
+    routeDefinition(STORAGE_TO_HOME);
 } // namespace mission_routes

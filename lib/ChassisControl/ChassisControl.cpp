@@ -62,15 +62,6 @@ void ChassisControl::update()
     }
 }
 
-bool ChassisControl::moveRelative(float forwardMm, float rightMm)
-{
-    return moveRelative(
-        forwardMm,
-        rightMm,
-        DRIVE_RPM,
-        DRIVE_ACCEL_RPM_PER_S);
-}
-
 bool ChassisControl::moveRelative(
     float forwardMm,
     float rightMm,

@@ -73,13 +73,9 @@ private:
     void updateAlignmentState();
     void updateStationTaskState();
 
-    bool startRoute(
-        const RouteAction *actions,
-        size_t count,
-        State routeState);
+    bool startRoute(RouteDefinition route, State routeState);
     bool startRouteWithTravelPreparation(
-        const RouteAction *actions,
-        size_t count,
+        RouteDefinition route,
         State routeState);
     bool startAlignment(Station station, State alignmentState);
     bool startStationTask(StationTask task, State taskState);

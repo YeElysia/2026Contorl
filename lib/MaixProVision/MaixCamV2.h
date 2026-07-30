@@ -14,7 +14,6 @@ constexpr uint8_t VERSION = 0x01;
 constexpr uint8_t MODE_GRAB = 0xCC;
 constexpr uint8_t MODE_IDLE = 0xFF;
 constexpr uint8_t CMD_SET_TARGET = 0x10;
-constexpr uint8_t CMD_PING = 0x11;
 constexpr uint8_t CMD_RESET = 0x13;
 
 struct Detection
@@ -38,7 +37,6 @@ public:
     void begin(uint32_t baudrate);
     void poll();
     uint8_t setTarget(uint8_t mode, uint8_t selector);
-    uint8_t ping();
     uint8_t reset();
 
     bool takeDetection(Detection &result);

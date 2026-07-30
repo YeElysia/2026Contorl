@@ -127,6 +127,8 @@ private:
         StepKind kind,
         float target,
         uint8_t group);
+    void addSafeRetraction(float baseTarget);
+    void addStorageDeposit();
     void loadInitializationAction();
     void loadHomeAction();
     void loadTurntablePreparationAction(uint8_t traySlot);
@@ -159,6 +161,7 @@ private:
         bool protection) const;
     void fail(const char *message);
 
+    static void resetStepperState(TTL_Stepper &motor);
     static bool validRing(uint8_t ring);
     static float clampValue(float value, float minimum, float maximum);
 };

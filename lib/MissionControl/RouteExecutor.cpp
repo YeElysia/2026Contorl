@@ -7,23 +7,23 @@ RouteExecutor::RouteExecutor(ChassisControl &chassis)
 {
 }
 
-bool RouteExecutor::start(
-    const RouteAction *actions,
-    size_t count)
+bool RouteExecutor::start(RouteDefinition route)
 {
     if (_result == AsyncResult::Running ||
         _chassis.busy() ||
         _chassis.state() == ChassisControl::State::Fault ||
-        (actions == nullptr && count != 0))
+        (route.actions == nullptr && route.count != 0))
     {
         return false;
     }
 
-    _actions = actions;
-    _count = count;
+    _actions = route.actions;
+    _count = route.count;
     _index = 0;
     _result =
-        count == 0 ? AsyncResult::Succeeded : AsyncResult::Running;
+        route.count == 0
+            ? AsyncResult::Succeeded
+            : AsyncResult::Running;
     return true;
 }
 
@@ -98,9 +98,4 @@ void RouteExecutor::cancel()
 AsyncResult RouteExecutor::result() const
 {
     return _result;
-}
-
-size_t RouteExecutor::actionIndex() const
-{
-    return _index;
 }

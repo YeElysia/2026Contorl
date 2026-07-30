@@ -9,26 +9,19 @@ namespace chassis_config
     constexpr uint32_t DIR_PINS[4] = {PD6, PE9, PD14, PC3_C};
     constexpr uint32_t STEP_PINS[4] = {PD4, PE11, PD15, PA1};
 
-    // 调试串口与 WIT/JY901 IMU 串口
-    constexpr uint32_t DEBUG_RX_PIN = PB12;
-    constexpr uint32_t DEBUG_TX_PIN = PB13;
+    // WIT/JY901 IMU 串口。PB12/PB13不启用，避免影响底盘。
     constexpr uint32_t IMU_RX_PIN = PD9;
     constexpr uint32_t IMU_TX_PIN = PD8;
-    constexpr uint32_t DEBUG_BAUD = 115200;
     constexpr uint32_t IMU_BAUD = 115200;
 
-    // 机械参数。换轮、调整细分或底盘尺寸时只修改这里。
+    // 机械参数。换轮或调整细分时只修改这里。
     constexpr float WHEEL_DIAMETER_MM = 100.0f;
-    constexpr float TRACK_WIDTH_MM = 195.0f;
-    constexpr float WHEELBASE_MM = 185.0f;
     constexpr float MOTOR_STEP_ANGLE_DEG = 1.8f;
     constexpr uint16_t MICROSTEPS = 32;
     constexpr float STEPS_PER_REV =
         (360.0f / MOTOR_STEP_ANGLE_DEG) * MICROSTEPS;
     constexpr float MM_PER_REV = PI * WHEEL_DIAMETER_MM;
     constexpr float STEPS_PER_MM = STEPS_PER_REV / MM_PER_REV;
-    constexpr float ROTATION_RADIUS_MM =
-        (TRACK_WIDTH_MM + WHEELBASE_MM) * 0.5f;
 
     // 电机正方向。若某个轮子反转，只修改对应项。
     constexpr int8_t MOTOR_SIGN[4] = {-1, 1, -1, 1};

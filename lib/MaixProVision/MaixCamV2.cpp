@@ -38,11 +38,6 @@ uint8_t MaixCamV2::setTarget(uint8_t mode, uint8_t selector)
     return sendFrame(CMD_SET_TARGET, payload, sizeof(payload));
 }
 
-uint8_t MaixCamV2::ping()
-{
-    return sendFrame(CMD_PING, nullptr, 0);
-}
-
 uint8_t MaixCamV2::reset()
 {
     return sendFrame(CMD_RESET, nullptr, 0);

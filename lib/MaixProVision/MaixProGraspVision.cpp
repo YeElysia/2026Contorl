@@ -11,7 +11,6 @@ void MaixProGraspVision::begin()
 {
     _camera.begin(vision_config::BAUD);
     _begun = true;
-    _camera.ping();
     _camera.reset();
     _active = false;
     _faulted = false;
