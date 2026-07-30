@@ -72,8 +72,11 @@ HardwareSerial serialDebug(
 
 ChassisControl chassis(&serialImu);
 maixcam::MaixCamV2 camera(serialVision);
-MaixProRingAlignment alignment(camera, chassis);
 IdleGraspVision idleGraspVision;
+MaixProRingAlignment alignment(
+    camera,
+    idleGraspVision,
+    chassis);
 IdleForwardPositioner idleForwardPositioner;
 MechanismTaskExecutor mechanism(
     serialMechanismStepper,
@@ -154,16 +157,21 @@ void updateSequence()
         break;
 
     case TestState::PreparingView:
+    {
         if (mechanism.result() != AsyncResult::Succeeded)
             return;
 
-        if (!alignment.start(Station::RoughProcessing, 0))
+        AlignmentRequest request;
+        request.station = Station::RoughProcessing;
+        request.round = 0;
+        if (!alignment.start(request))
         {
             enterFault("ring alignment start rejected");
             return;
         }
         state = TestState::Aligning;
         break;
+    }
 
     case TestState::Aligning:
         if (alignment.result() == AsyncResult::Succeeded)
@@ -208,6 +216,12 @@ void printReport()
     serialDebug.print(ring.dx);
     serialDebug.print(" dy=");
     serialDebug.print(ring.dy);
+    serialDebug.print(" err=");
+    serialDebug.print(
+        ring.dx - vision_config::RING_TARGET_DX_PX);
+    serialDebug.print(",");
+    serialDebug.print(
+        ring.dy - vision_config::RING_TARGET_DY_PX);
     serialDebug.print(" q=");
     serialDebug.print(ring.quality);
     serialDebug.print(" moveF=");
