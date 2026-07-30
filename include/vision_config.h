@@ -10,64 +10,85 @@
  */
 namespace vision_config
 {
-constexpr uint32_t RX_PIN = PE7;
-constexpr uint32_t TX_PIN = PE8;
-constexpr uint32_t BAUD = 115200;
+    constexpr uint32_t RX_PIN = PE7;
+    constexpr uint32_t TX_PIN = PE8;
+    constexpr uint32_t BAUD = 115200;
 
-constexpr int16_t TARGET_DX_PX = 10;
-constexpr int16_t TARGET_DY_PX = -25;
-constexpr int16_t CENTER_TOLERANCE_PX = 8;
-constexpr uint8_t REQUIRED_STABLE_FRAMES = 3;
-constexpr uint8_t MIN_QUALITY = 30;
+    constexpr int16_t TARGET_DX_PX = 13;
+    constexpr int16_t TARGET_DY_PX = 0;
+    constexpr int16_t CENTER_TOLERANCE_PX = 8;
+    constexpr uint8_t REQUIRED_STABLE_FRAMES = 3;
+    constexpr uint8_t MIN_QUALITY = 30;
 
-constexpr uint32_t TARGET_STALE_MS = 500;
-constexpr uint32_t TARGET_SEARCH_TIMEOUT_MS = 20000;
+    constexpr uint32_t TARGET_STALE_MS = 500;
+    /*
+     * 原料盘持续旋转且相机无法同时看到全部物料。搜索窗口必须覆盖
+     * 至少一整圈，否则目标颜色尚未转入可抓取范围就会退出识别。
+     */
+    constexpr uint32_t TARGET_SEARCH_TIMEOUT_MS = 60000;
 
-/*
- * 图像误差到机构修正量的二维标定矩阵：
- *
- *   forwardDelta   = FORWARD_FROM_DX * dx + FORWARD_FROM_DY * dy
- *   extensionDelta = EXT_FROM_DX     * dx + EXT_FROM_DY     * dy
- *
- * 底盘前后单位为mm，伸缩单位为0.1mm。底盘只允许前后移动，
- * 朝转盘方向的误差全部由伸缩轴补偿。交叉项可用于补偿相机倾斜。
- */
-constexpr float FORWARD_FROM_DX = -0.2F;
-constexpr float FORWARD_FROM_DY = 0.0F;
-constexpr float EXTENSION_FROM_DX = 0.0F;
-constexpr float EXTENSION_FROM_DY = 3.0F;
+    /*
+     * 图像误差到机构修正量的二维标定矩阵：
+     *
+     *   forwardDelta   = FORWARD_FROM_DX * dx + FORWARD_FROM_DY * dy
+     *   extensionDelta = EXT_FROM_DX     * dx + EXT_FROM_DY     * dy
+     *
+     * 底盘前后单位为mm，伸缩单位为0.1mm。底盘只允许前后移动，
+     * 朝转盘方向的误差全部由伸缩轴补偿。交叉项可用于补偿相机倾斜。
+     */
+    constexpr float FORWARD_FROM_DX = -0.2F;
+    constexpr float FORWARD_FROM_DY = 0.0F;
+    constexpr float EXTENSION_FROM_DX = 0.0F;
+    constexpr float EXTENSION_FROM_DY = 3.0F;
 
-// 远离中心时直接大步到达，进入精调区后限制单次修正量。
-constexpr int16_t FINE_ALIGNMENT_ZONE_PX = 24;
-constexpr float COARSE_FORWARD_MAX_DELTA_MM = 15.0F;
-constexpr float COARSE_EXTENSION_MAX_DELTA = 300.0F;
-constexpr float FINE_FORWARD_MAX_DELTA_MM = 3.0F;
-constexpr float FINE_EXTENSION_MAX_DELTA = 30.0F;
+    // 远离中心时直接大步到达，进入精调区后限制单次修正量。
+    constexpr int16_t FINE_ALIGNMENT_ZONE_PX = 24;
+    constexpr float COARSE_FORWARD_MAX_DELTA_MM = 15.0F;
+    constexpr float COARSE_EXTENSION_MAX_DELTA = 300.0F;
+    constexpr float FINE_FORWARD_MAX_DELTA_MM = 3.0F;
+    constexpr float FINE_EXTENSION_MAX_DELTA = 30.0F;
 
-/*
- * 视觉闭环软限位只约束原料区跟随动作。
- * 不能把机械硬限位直接当作软件目标。
- */
-constexpr float PICKUP_FORWARD_MIN_OFFSET_MM = -50.0F;
-constexpr float PICKUP_FORWARD_MAX_OFFSET_MM = 50.0F;
-constexpr float PICKUP_EXTENSION_MIN = 300.0F;
-constexpr float PICKUP_EXTENSION_MAX = 1400.0F;
+    /*
+     * 视觉闭环软限位只约束原料区跟随动作。
+     * 不能把机械硬限位直接当作软件目标。
+     */
+    /*
+     * 原料区路线基准保持在x=1200。
+     * 完成后仍由状态机回到路线基准，不影响后续固定坐标移动。
+     */
+    constexpr float PICKUP_FORWARD_MIN_OFFSET_MM = -100.0F;
+    constexpr float PICKUP_FORWARD_MAX_OFFSET_MM = 100.0F;
+    constexpr float PICKUP_EXTENSION_MIN = 300.0F;
+    constexpr float PICKUP_EXTENSION_MAX = 1400.0F;
 
-// -------------------- 粗加工区圆环整车对准 --------------------
-// 参考new_project的圆环3定位，后续可按相机视野调整圆环编号。
-constexpr uint8_t ROUGH_RING_ID = 3;
-constexpr int16_t RING_TARGET_DX_PX = 0;
-constexpr int16_t RING_TARGET_DY_PX = 0;
-constexpr int16_t RING_CENTER_TOLERANCE_PX = 10;
-constexpr int16_t RING_FINE_ALIGNMENT_ZONE_PX = 25;
-constexpr uint8_t RING_REQUIRED_STABLE_FRAMES = 3;
-constexpr uint8_t RING_MIN_QUALITY = 30;
+    // -------------------- 粗加工区圆环整车对准 --------------------
+    // 参考new_project的圆环3定位，后续可按相机视野调整圆环编号。
+    constexpr uint8_t ROUGH_RING_ID = 2;
+    // 暂存区以2号位为统一视觉基准，第二轮再识别该位置上的颜色。
+    constexpr uint8_t STORAGE_REFERENCE_RING_ID = 2;
+    // 圆环和原料识别使用同一套相机光轴标定中心，避免重复配置漂移。
+    constexpr int16_t RING_TARGET_DX_PX = TARGET_DX_PX;
+    constexpr int16_t RING_TARGET_DY_PX = TARGET_DY_PX;
+    /*
+     * 圆环目标复用上方相机标定中心。实车识别值会在中心附近波动，
+     * 底盘也无法稳定执行亚毫米修正，因此允许±2px，避免反复振荡。
+     */
+    constexpr int16_t RING_CENTER_TOLERANCE_PX = 2;
+    constexpr int16_t RING_FINE_ALIGNMENT_ZONE_PX = 25;
+    constexpr uint8_t RING_REQUIRED_STABLE_FRAMES = 3;
+    constexpr uint8_t RING_MIN_QUALITY = 30;
 
-// 相机误差到车体坐标：forward>0前进，right>0右移。
-constexpr float RING_FORWARD_MM_PER_DY_PX = 0.8F;
-constexpr float RING_RIGHT_MM_PER_DX_PX = -0.8F;
-constexpr float RING_COARSE_MAX_MOVE_MM = 30.0F;
-constexpr float RING_FINE_MAX_MOVE_MM = 10.0F;
-constexpr uint32_t RING_TARGET_STALE_MS = 500;
-constexpr uint32_t RING_ALIGNMENT_TIMEOUT_MS = 12000;
+    /*
+     * 实车闭环标定结果：
+     * 直接令小车前进/右移会使正的dx/dy继续增大，因此控制修正量
+     * 必须取反。这里描述的是“消除误差所需的底盘运动”，不是图像
+     * 中圆环所在的方向。
+     */
+    constexpr float RING_FORWARD_MM_PER_DX_PX = -0.3F;
+    constexpr float RING_RIGHT_MM_PER_DY_PX = -0.3F;
+    constexpr float RING_COARSE_MAX_MOVE_MM = 30.0F;
+    constexpr float RING_FINE_MAX_MOVE_MM = 10.0F;
+    // 相机检测周期接近500ms，留出三倍周期，避免误清稳定计数。
+    constexpr uint32_t RING_TARGET_STALE_MS = 1500;
+    constexpr uint32_t RING_ALIGNMENT_TIMEOUT_MS = 12000;
 } // namespace vision_config

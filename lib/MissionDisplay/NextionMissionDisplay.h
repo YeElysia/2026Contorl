@@ -21,6 +21,8 @@ public:
 
     void begin(uint32_t baud, uint32_t restartWaitMs);
     void update();
+    StartZone selectedStartZone() const;
+    bool hasStartZoneSelection() const;
 
 private:
     HardwareSerial &_serial;
@@ -31,9 +33,18 @@ private:
         static_cast<MissionController::State>(0xFF);
     char _lastQrText[16] = {};
     uint32_t _screenReadyMs = 0;
+    uint32_t _lastStartZoneQueryMs = 0;
+    StartZone _selectedStartZone = StartZone::LowerRight;
+    bool _hasStartZoneSelection = false;
+    uint8_t _response[8] = {};
+    uint8_t _responseLength = 0;
+    uint8_t _responseTerminatorCount = 0;
 
     void updateState();
     void updateQrText();
+    void updateStartZoneSelection();
+    void readResponses();
+    void processResponse();
     void showState(MissionController::State state);
 
     void sendCommand(const char *command);

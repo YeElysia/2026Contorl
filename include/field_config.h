@@ -1,5 +1,7 @@
 #pragma once
 
+#include "start_zone.h"
+
 namespace field_config
 {
     /*
@@ -8,9 +10,29 @@ namespace field_config
      * +x指向小车出发时的左侧，+y指向出发时的车头方向。
      * 航向角为0度时车头朝向+y。
      */
-    constexpr float START_X_MM = 185.0F;
-    constexpr float START_Y_MM = 150.0F;
-    constexpr float START_YAW_DEG = 0.0F;
+    struct StartPose
+    {
+        float xMm;
+        float yMm;
+        float yawDeg;
+    };
+
+    constexpr StartPose LOWER_RIGHT_START = {
+        185.0F, 150.0F, 0.0F};
+    constexpr StartPose UPPER_RIGHT_START = {
+        185.0F, 2250.0F, 0.0F};
+
+    constexpr StartPose startPose(StartZone zone)
+    {
+        return zone == StartZone::UpperRight
+                   ? UPPER_RIGHT_START
+                   : LOWER_RIGHT_START;
+    }
+
+    // 兼容已有的单启停区测试代码，默认仍使用右下方启停区。
+    constexpr float START_X_MM = LOWER_RIGHT_START.xMm;
+    constexpr float START_Y_MM = LOWER_RIGHT_START.yMm;
+    constexpr float START_YAW_DEG = LOWER_RIGHT_START.yawDeg;
 
     // 所有改变航向的动作只能在场地中心完成。
     constexpr float TURN_CENTER_X_MM = 1200.0F;
@@ -34,11 +56,14 @@ namespace field_config
     }
 
     static_assert(
-        START_X_MM >= CHASSIS_WIDTH_MM * 0.5F,
-        "start x places chassis outside lower field boundary");
+        LOWER_RIGHT_START.xMm >= CHASSIS_WIDTH_MM * 0.5F &&
+            UPPER_RIGHT_START.xMm >= CHASSIS_WIDTH_MM * 0.5F,
+        "start x places chassis outside field boundary");
     static_assert(
-        START_Y_MM >= CHASSIS_LENGTH_MM * 0.5F,
-        "start y places chassis outside lower field boundary");
+        LOWER_RIGHT_START.yMm >= CHASSIS_LENGTH_MM * 0.5F &&
+            UPPER_RIGHT_START.yMm <=
+                FIELD_LENGTH_MM - CHASSIS_LENGTH_MM * 0.5F,
+        "start y places chassis outside field boundary");
     static_assert(
         hasRotationClearance(TURN_CENTER_X_MM, TURN_CENTER_Y_MM),
         "turn center has insufficient chassis rotation clearance");

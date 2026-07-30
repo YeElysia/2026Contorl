@@ -14,12 +14,46 @@
  *
  * 高层只提交“取料/粗加工/码垛”任务。本类把任务展开成基础动作表，
  * 同一动作组中的独立执行器并行运动，动作组之间保持必要的安全顺序。
- * 升降轴和底座旋转轴禁止进入同一动作组，始终先升降、后旋转。
+ * 升降轴禁止与任何其他执行器并行，所在动作组始终只有升降动作。
+ * 转换工位姿态时先升到安全高度再移动其他轴；下降到工作高度则
+ * 等其他轴定位完成后执行。
  * 每次update只下发命令或轮询状态，不使用delay和阻塞wait。
  */
 class MechanismTaskExecutor : public IStationTaskExecutor
 {
 public:
+    /**
+     * @brief 舵机动作的只读诊断快照。
+     *
+     * status是FashionStar协议状态码：0成功，8响应超时。
+     * validPolls/polls可区分“舵机未到位”和“完全没有有效反馈”。
+     */
+    struct ServoDebugState
+    {
+        float target = 0.0F;
+        float actual = 0.0F;
+        uint16_t polls = 0;
+        uint16_t validPolls = 0;
+        uint16_t power = 0;
+        uint8_t status = 0xFF;
+        bool issued = false;
+        bool hasActual = false;
+        bool hasPower = false;
+    };
+
+    struct GraspDebugState
+    {
+        int16_t dx = 0;
+        int16_t dy = 0;
+        uint8_t quality = 0;
+        uint8_t item = 0;
+        float forwardOffsetMm = 0.0F;
+        float extensionTarget = 0.0F;
+        bool tracking = false;
+        bool found = false;
+        bool hasObservation = false;
+    };
+
     MechanismTaskExecutor(
         HardwareSerial &stepperSerial,
         HardwareSerial &baseSerial,
@@ -30,14 +64,19 @@ public:
     /**
      * @brief 初始化总线并让机构到达上电初始位置。
      *
-     * 初始化动作由update异步完成；ready()为true后才允许开始比赛。
-     * 按下启动键后，机构会在底盘行驶期间转到运输收纳位置。
+     * 初始化动作由update异步完成。若期间按下启动键，
+     * prepareForTravel()会直接切换到运输收纳动作，与底盘并行。
      */
     void begin();
 
     bool ready() const override;
     const char *faultMessage() const override;
-    bool prepareForTravel() override;
+    const char *debugPhase() const;
+    const ServoDebugState &storageServoDebug() const;
+    const ServoDebugState &gripperServoDebug() const;
+    const GraspDebugState &graspDebug() const;
+    bool prepareForTravel(
+        TravelDestination destination) override;
 
     bool start(
         StationTask task,
@@ -56,6 +95,7 @@ private:
         RotateStorage,
         OpenGripper,
         OpenGripperMax,
+        CloseGripperUnloaded,
         CloseGripper
     };
 
@@ -69,6 +109,7 @@ private:
         uint32_t startedMs;
         uint32_t lastPollMs;
         uint8_t stableFeedbackCount;
+        uint8_t faultFeedbackCount;
         float previousFeedbackAngle;
         bool hasPreviousFeedback;
     };
@@ -104,6 +145,9 @@ private:
     FSUS_Protocol _servoProtocol;
     FSUS_Servo _storageServo;
     FSUS_Servo _gripperServo;
+    ServoDebugState _storageServoDebug;
+    ServoDebugState _gripperServoDebug;
+    GraspDebugState _graspDebug;
 
     ActionStep _steps[MAX_ACTION_STEPS] = {};
     uint8_t _stepCount = 0;
@@ -138,7 +182,7 @@ private:
     void addSafeRetraction(float baseTarget);
     void addStorageDeposit();
     void loadInitializationAction();
-    void loadHomeAction();
+    void loadHomeAction(float liftTarget);
     void loadTurntablePreparationAction(uint8_t traySlot);
     void loadTurntablePickupToStorageAction();
     void loadStorageToRingAction(
@@ -159,13 +203,16 @@ private:
         TTL_Stepper &motor,
         ActionStep &step,
         bool angle);
-    void pollStepperState(
+    bool pollStepperState(
         TTL_Stepper &motor,
         ActionStep &step,
         uint32_t now);
     void issueServoStep(ActionStep &step);
     bool updateServoStep(ActionStep &step);
-    bool queryServoAngle(FSUS_Servo &servo, float &angle);
+    bool queryServoAngle(
+        FSUS_Servo &servo,
+        ServoDebugState &debug,
+        float &angle);
     void onActionCompleted();
     void finishStationTask();
     const char *stepperFaultMessage(

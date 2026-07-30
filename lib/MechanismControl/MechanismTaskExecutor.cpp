@@ -64,6 +64,8 @@ void MechanismTaskExecutor::begin()
         fail("mechanism servo offline");
         return;
     }
+    // 与new_project一致：载物盘使用标准角度指令和库内速度换算。
+    _storageServo.setSpeed(STORAGE_SPEED_DPS);
 
     _initialized = false;
     _result = AsyncResult::Running;
@@ -83,15 +85,80 @@ const char *MechanismTaskExecutor::faultMessage() const
     return _fault;
 }
 
-bool MechanismTaskExecutor::prepareForTravel()
+const char *MechanismTaskExecutor::debugPhase() const
 {
-    if (!ready() || _result == AsyncResult::Running)
+    switch (_phase)
+    {
+    case TaskPhase::Initializing:
+        return "INIT";
+    case TaskPhase::PreparingForTravel:
+        return "TRAVEL";
+    case TaskPhase::CollectPreparing:
+        return "COLLECT_PREP";
+    case TaskPhase::CollectAligning:
+        return "COLLECT_ALIGN";
+    case TaskPhase::CollectDepositing:
+        return "COLLECT_DEPOSIT";
+    case TaskPhase::CollectReturningToRoute:
+        return "COLLECT_RETURN";
+    case TaskPhase::RoughPlacing:
+        return "ROUGH_PLACE";
+    case TaskPhase::RoughRetrieving:
+        return "ROUGH_GET";
+    case TaskPhase::FinalStoring:
+        return "FINAL_STORE";
+    case TaskPhase::Idle:
+        return "IDLE";
+    }
+    return "UNKNOWN";
+}
+
+const MechanismTaskExecutor::ServoDebugState &
+MechanismTaskExecutor::storageServoDebug() const
+{
+    return _storageServoDebug;
+}
+
+const MechanismTaskExecutor::ServoDebugState &
+MechanismTaskExecutor::gripperServoDebug() const
+{
+    return _gripperServoDebug;
+}
+
+const MechanismTaskExecutor::GraspDebugState &
+MechanismTaskExecutor::graspDebug() const
+{
+    return _graspDebug;
+}
+
+bool MechanismTaskExecutor::prepareForTravel(
+    TravelDestination destination)
+{
+    if (_result == AsyncResult::Failed)
         return false;
 
+    const bool interruptingInitialization =
+        _result == AsyncResult::Running &&
+        _phase == TaskPhase::Initializing;
+    if (!interruptingInitialization &&
+        (!ready() || _result == AsyncResult::Running))
+    {
+        return false;
+    }
+
+    /*
+     * 初始化尚未完成时，loadHomeAction()会清除旧动作表并向各轴
+     * 下发运输位目标。步进驱动支持重新设定绝对目标，无需停车等待。
+     */
     _result = AsyncResult::Running;
     _phase = TaskPhase::PreparingForTravel;
     _fault = "";
-    loadHomeAction();
+    const float liftTarget =
+        destination == TravelDestination::RoughProcessing ||
+                destination == TravelDestination::Storage
+            ? LIFT_STATION_VISION
+            : LIFT_HOME;
+    loadHomeAction(liftTarget);
     return true;
 }
 
@@ -150,13 +217,12 @@ bool MechanismTaskExecutor::start(
 
 void MechanismTaskExecutor::update()
 {
-    _graspVision.update();
-
     if (_result != AsyncResult::Running)
         return;
 
     if (_phase == TaskPhase::CollectAligning)
     {
+        _graspVision.update();
         updatePickupAlignment();
         return;
     }
@@ -222,17 +288,14 @@ void MechanismTaskExecutor::addConcurrentStep(
     }
 
     /*
-     * 升降轴与底座旋转轴在机构上不再视为可并行执行。
-     * 即使动作表误用了addConcurrentStep，也自动拆到下一组，
-     * 并保持调用顺序不变。
+     * 升降动作必须独占动作组。无论其他执行器是否存在机械干涉，
+     * 都必须等待升降到位后再启动，避免共用电源和结构振动造成误判。
+     * 即使动作表误用了并行接口，也自动拆到下一组并保持调用顺序。
      */
-    const bool conflictsWithLift =
-        kind == StepKind::RotateBase &&
+    const bool liftMustRunAlone =
+        kind == StepKind::Lift ||
         lastGroupContains(StepKind::Lift);
-    const bool conflictsWithBase =
-        kind == StepKind::Lift &&
-        lastGroupContains(StepKind::RotateBase);
-    if (conflictsWithLift || conflictsWithBase)
+    if (liftMustRunAlone)
     {
         addStep(kind, target);
         return;
@@ -261,6 +324,7 @@ void MechanismTaskExecutor::appendStep(
         group,
         false,
         false,
+        0,
         0,
         0,
         0,
@@ -305,13 +369,29 @@ void MechanismTaskExecutor::addStorageDeposit()
     addStep(StepKind::Lift, LIFT_HOME);
 }
 
-void MechanismTaskExecutor::loadHomeAction()
+void MechanismTaskExecutor::loadHomeAction(float liftTarget)
 {
     clearAction();
 
-    addSafeRetraction(BASE_HOME);
+    const bool liftingToSafeHeight =
+        liftTarget <= LIFT_HOME;
+
+    /*
+     * 升轴先于所有横向动作，先建立安全间隙；降轴则必须等底座、
+     * 伸缩、载物盘和夹爪全部到位后再执行。粗加工视觉高度900
+     * 属于降轴动作，因此会排在本动作表最后。
+     */
+    if (liftingToSafeHeight)
+        addStep(StepKind::Lift, liftTarget);
+
+    addStep(StepKind::RotateBase, BASE_HOME);
+    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
     addConcurrentStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[0]);
-    addConcurrentStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+    // 运输收纳时保持夹爪张开，避免到粗加工区后遮挡圆环视野。
+    addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
+
+    if (!liftingToSafeHeight)
+        addStep(StepKind::Lift, liftTarget);
 }
 
 void MechanismTaskExecutor::loadInitializationAction()
@@ -321,7 +401,10 @@ void MechanismTaskExecutor::loadInitializationAction()
     addStep(StepKind::RotateBase, BASE_INITIAL);
     addConcurrentStep(StepKind::Extend, EXTENSION_INITIAL);
     addConcurrentStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[0]);
-    addConcurrentStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+    // 初始化时夹爪内没有物料，只按角度确认空载闭合。
+    addConcurrentStep(
+        StepKind::CloseGripperUnloaded,
+        GRIPPER_CLOSE_ANGLE);
 }
 
 void MechanismTaskExecutor::loadTurntablePreparationAction(uint8_t traySlot)
@@ -361,6 +444,11 @@ void MechanismTaskExecutor::startPickupAlignment()
     _lastObservationMs = 0;
     _alignmentObservationAfterMs = _alignmentStartedMs;
     _alignmentExtensionTarget = EXTENSION_TURNTABLE;
+    _graspDebug = {};
+    _graspDebug.item = _itemIndex + 1;
+    _graspDebug.forwardOffsetMm = _alignmentForwardOffset;
+    _graspDebug.extensionTarget = _alignmentExtensionTarget;
+    _graspDebug.tracking = true;
 
     if (!_graspVision.startTracking(_batch.colors[_itemIndex]))
     {
@@ -390,6 +478,7 @@ void MechanismTaskExecutor::updatePickupAlignment()
 
     if (now - _alignmentStartedMs >= TARGET_SEARCH_TIMEOUT_MS)
     {
+        _graspDebug.tracking = false;
         fail("grasp target search timeout");
         return;
     }
@@ -436,6 +525,11 @@ void MechanismTaskExecutor::updatePickupAlignment()
     }
 
     _lastObservationMs = observation.receivedMs;
+    _graspDebug.dx = observation.dx;
+    _graspDebug.dy = observation.dy;
+    _graspDebug.quality = observation.quality;
+    _graspDebug.found = observation.found;
+    _graspDebug.hasObservation = true;
     if (!observation.found || observation.quality < MIN_QUALITY)
     {
         _stableFrames = 0;
@@ -455,6 +549,7 @@ void MechanismTaskExecutor::updatePickupAlignment()
 
         if (_stableFrames >= REQUIRED_STABLE_FRAMES)
         {
+            _graspDebug.tracking = false;
             _graspVision.stop();
             _phase = TaskPhase::CollectDepositing;
             loadTurntablePickupToStorageAction();
@@ -511,6 +606,7 @@ void MechanismTaskExecutor::updatePickupAlignment()
             return;
         }
         _alignmentForwardOffset = nextForwardOffset;
+        _graspDebug.forwardOffsetMm = _alignmentForwardOffset;
         _forwardCommandActive = true;
     }
 
@@ -519,6 +615,7 @@ void MechanismTaskExecutor::updatePickupAlignment()
             _alignmentExtensionTarget) > 0.1F)
     {
         _alignmentExtensionTarget = nextExtensionTarget;
+        _graspDebug.extensionTarget = _alignmentExtensionTarget;
         addStep(
             StepKind::Extend,
             _alignmentExtensionTarget);
@@ -526,7 +623,14 @@ void MechanismTaskExecutor::updatePickupAlignment()
 
     if (!_forwardCommandActive && _stepCount == 0)
     {
-        fail("material alignment reached safe limit");
+        /*
+         * 原料转盘仍在旋转。目标颜色位于视野边缘时，底盘和伸缩轴
+         * 可能已经到达本工位软限位，此时不能继续追赶，也不应立即
+         * 终止整场任务。保持当前位置读取后续新帧，等待目标随转盘
+         * 进入可抓取范围；TARGET_SEARCH_TIMEOUT_MS仍负责最终兜底。
+         */
+        _stableFrames = 0;
+        return;
     }
 }
 
@@ -575,7 +679,14 @@ void MechanismTaskExecutor::loadStorageToRingAction(
     uint8_t stackLevel)
 {
     clearAction();
-    // 车内取料准备互不干涉，载物盘、底座、伸缩轴和夹爪同时动作。
+
+    /*
+     * 粗加工圆环识别结束时升降轴位于900。必须先升回安全高度，
+     * 再允许底座和伸缩轴进入车内取料位置。
+     */
+    addStep(StepKind::Lift, LIFT_HOME);
+
+    // 升轴完成后，车内取料的其他准备动作可以并行。
     addStep(
         StepKind::RotateStorage,
         TRAY_SLOT_ANGLE[traySlot]);
@@ -606,6 +717,10 @@ void MechanismTaskExecutor::loadRingToStorageAction(
     const RingPose &pose)
 {
     clearAction();
+
+    // 每次圆环取回都先确认升降轴处于安全高度，再移动其他轴。
+    addStep(StepKind::Lift, LIFT_HOME);
+
     addStep(
         StepKind::RotateStorage,
         TRAY_SLOT_ANGLE[traySlot]);
@@ -673,6 +788,7 @@ bool MechanismTaskExecutor::updateActionStep(ActionStep &step)
     case StepKind::RotateStorage:
     case StepKind::OpenGripper:
     case StepKind::OpenGripperMax:
+    case StepKind::CloseGripperUnloaded:
     case StepKind::CloseGripper:
         return updateServoStep(step);
     }
@@ -714,23 +830,40 @@ bool MechanismTaskExecutor::updateStepperStep(
         return false;
     }
 
-    pollStepperState(motor, step, now);
+    const bool freshFeedback =
+        pollStepperState(motor, step, now);
+    if (!freshFeedback)
+        return false;
 
-    if (motor.locked_state)
+    /*
+     * 驱动器可能在减速到位瞬间同时返回“到位”和短暂“堵转”。
+     * 机械位置已经成立时应优先结束动作，不能把成功误报为故障。
+     */
+    if (motor.onPos_state)
     {
-        fail(stepperFaultMessage(motor, false));
+        step.faultFeedbackCount = 0;
+        return true;
+    }
+
+    if (motor.locked_state || motor.loPro_state)
+    {
+        if (step.faultFeedbackCount < STEPPER_FAULT_CONFIRM_COUNT)
+            ++step.faultFeedbackCount;
+
+        if (step.faultFeedbackCount >= STEPPER_FAULT_CONFIRM_COUNT)
+        {
+            fail(stepperFaultMessage(
+                motor,
+                motor.loPro_state));
+        }
         return false;
     }
 
-    if (motor.loPro_state)
-    {
-        fail(stepperFaultMessage(motor, true));
-        return false;
-    }
-    return motor.onPos_state;
+    step.faultFeedbackCount = 0;
+    return false;
 }
 
-void MechanismTaskExecutor::pollStepperState(
+bool MechanismTaskExecutor::pollStepperState(
     TTL_Stepper &motor,
     ActionStep &step,
     uint32_t now)
@@ -749,30 +882,33 @@ void MechanismTaskExecutor::pollStepperState(
         if (_sharedPollOwner != nullptr &&
             _sharedPollOwner != &motor)
         {
-            return;
+            return false;
         }
 
         if (now - _lastSharedBusPollMs < STEPPER_POLL_MS)
-            return;
+            return false;
 
         if (_sharedPollOwner == nullptr)
             _sharedPollOwner = &motor;
 
         _lastSharedBusPollMs = now;
+        const bool responsePending = motor.Ask_State;
         motor.state_update();
 
         // Ask_State清零表示该电机的应答已经完整解析。
         if (!motor.Ask_State)
             _sharedPollOwner = nullptr;
-        return;
+        return responsePending && !motor.Ask_State;
     }
 
     if (step.lastPollMs != 0 &&
         now - step.lastPollMs < STEPPER_POLL_MS)
-        return;
+        return false;
 
     step.lastPollMs = now;
+    const bool responsePending = motor.Ask_State;
     motor.state_update();
+    return responsePending && !motor.Ask_State;
 }
 
 void MechanismTaskExecutor::issueServoStep(ActionStep &step)
@@ -784,31 +920,35 @@ void MechanismTaskExecutor::issueServoStep(ActionStep &step)
     step.previousFeedbackAngle = 0.0F;
     step.hasPreviousFeedback = false;
 
+    ServoDebugState &debug =
+        step.kind == StepKind::RotateStorage
+            ? _storageServoDebug
+            : _gripperServoDebug;
+    debug = {};
+    debug.target = step.target;
+    debug.issued = true;
+
     switch (step.kind)
     {
     case StepKind::RotateStorage:
-        _storageServo.setRawAngleByVelocity(
-            _storageServo.angleReal2Raw(step.target),
-            STORAGE_SPEED_DPS,
-            0,
-            0,
-            0);
+        /*
+         * 实车舵机固件不执行“按速度控制”扩展指令，但标准角度
+         * 指令已经由new_project验证。setAngle只下发命令，不等待到位。
+         */
+        _storageServo.setAngle(step.target);
         break;
     case StepKind::OpenGripper:
     case StepKind::OpenGripperMax:
-        _gripperServo.setRawAngleByVelocity(
-            _gripperServo.angleReal2Raw(step.target),
-            GRIPPER_SPEED_DPS,
-            0,
-            0,
+        _gripperServo.setAngle(
+            step.target,
+            GRIPPER_COMMAND_INTERVAL_MS,
             0);
         break;
+    case StepKind::CloseGripperUnloaded:
     case StepKind::CloseGripper:
-        _gripperServo.setRawAngleByVelocity(
-            _gripperServo.angleReal2Raw(step.target),
-            GRIPPER_SPEED_DPS,
-            0,
-            0,
+        _gripperServo.setAngle(
+            step.target,
+            GRIPPER_COMMAND_INTERVAL_MS,
             GRIPPER_MAX_POWER);
         break;
     default:
@@ -844,8 +984,12 @@ bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
         step.kind == StepKind::RotateStorage
             ? _storageServo
             : _gripperServo;
+    ServoDebugState &debug =
+        step.kind == StepKind::RotateStorage
+            ? _storageServoDebug
+            : _gripperServoDebug;
     float actualAngle = 0.0F;
-    if (!queryServoAngle(servo, actualAngle))
+    if (!queryServoAngle(servo, debug, actualAngle))
     {
         step.stableFeedbackCount = 0;
         return false;
@@ -863,17 +1007,18 @@ bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
     step.previousFeedbackAngle = actualAngle;
     step.hasPreviousFeedback = true;
 
-    if (step.kind == StepKind::CloseGripper && !reached)
+    if (step.kind == StepKind::CloseGripper)
     {
         /*
-         * 夹住物料后，夹爪本来就不应继续到空载闭合角度。
-         * 实际角度确认夹爪已经离开张开端，再用功率判断是否形成
-         * 有效夹持；通信失败返回0，不会被误判成夹紧成功。
+         * 搬运时不能仅凭到达空载闭合角度判定成功，否则目标偏离
+         * 夹爪时也会继续抬升。必须同时确认夹爪停止且持续形成负载。
          */
         const uint16_t power = _gripperServo.queryPower();
         const bool powerValid =
             _servoProtocol.responsePack.recv_status ==
             FSUS_STATUS_SUCCESS;
+        debug.power = power;
+        debug.hasPower = powerValid;
         reached =
             powerValid &&
             actualAngle >= GRIPPER_LOAD_MIN_ANGLE &&
@@ -891,23 +1036,38 @@ bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
         step.stableFeedbackCount = 0;
     }
 
+    const uint8_t requiredStableFeedback =
+        step.kind == StepKind::CloseGripper
+            ? GRIPPER_STABLE_FEEDBACK_COUNT
+            : SERVO_STABLE_FEEDBACK_COUNT;
     return step.stableFeedbackCount >=
-           SERVO_STABLE_FEEDBACK_COUNT;
+           requiredStableFeedback;
 }
 
 bool MechanismTaskExecutor::queryServoAngle(
     FSUS_Servo &servo,
+    ServoDebugState &debug,
     float &angle)
 {
     angle = servo.queryAngle();
     const uint8_t status = _servoProtocol.responsePack.recv_status;
+    ++debug.polls;
+    debug.status = status;
 
     /*
      * 供应商协议解析器在校验和异常时仍会解析完整角度帧，
      * 因此允许该状态参与后续的连续两帧确认。其他错误一律重试。
      */
-    return status == FSUS_STATUS_SUCCESS ||
-           status == FSUS_STATUS_CHECKSUM_ERROR;
+    const bool valid =
+        status == FSUS_STATUS_SUCCESS ||
+        status == FSUS_STATUS_CHECKSUM_ERROR;
+    if (valid)
+    {
+        debug.actual = angle;
+        debug.hasActual = true;
+        ++debug.validPolls;
+    }
+    return valid;
 }
 
 void MechanismTaskExecutor::onActionCompleted()
@@ -922,6 +1082,8 @@ void MechanismTaskExecutor::onActionCompleted()
         break;
 
     case TaskPhase::PreparingForTravel:
+        // 直接从初始化切入运输动作时，也在收纳完成后建立ready状态。
+        _initialized = true;
         _phase = TaskPhase::Idle;
         _result = AsyncResult::Succeeded;
         clearAction();

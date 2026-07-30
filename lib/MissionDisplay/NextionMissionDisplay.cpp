@@ -34,8 +34,89 @@ void NextionMissionDisplay::update()
     if (static_cast<int32_t>(millis() - _screenReadyMs) < 0)
         return;
 
+    readResponses();
     updateState();
     updateQrText();
+    updateStartZoneSelection();
+}
+
+StartZone NextionMissionDisplay::selectedStartZone() const
+{
+    return _selectedStartZone;
+}
+
+bool NextionMissionDisplay::hasStartZoneSelection() const
+{
+    return _hasStartZoneSelection;
+}
+
+void NextionMissionDisplay::updateStartZoneSelection()
+{
+    /*
+     * 仅在发车前读取DEBUG.n4，避免比赛运行期间无意义地占用串口。
+     * 200ms周期允许操作界面后很快刷新，同时不会淹没屏幕接收缓冲区。
+     */
+    const MissionController::State state = _mission.state();
+    if (state != MissionController::State::Startup &&
+        state != MissionController::State::WaitingForStart)
+    {
+        return;
+    }
+
+    const uint32_t now = millis();
+    if (now - _lastStartZoneQueryMs < 200)
+        return;
+
+    _lastStartZoneQueryMs = now;
+    sendCommand("get DEBUG.n4.val");
+}
+
+void NextionMissionDisplay::readResponses()
+{
+    while (_serial.available())
+    {
+        const uint8_t value =
+            static_cast<uint8_t>(_serial.read());
+
+        if (value == 0xFF)
+        {
+            if (++_responseTerminatorCount == 3)
+            {
+                processResponse();
+                _responseLength = 0;
+                _responseTerminatorCount = 0;
+            }
+            continue;
+        }
+
+        /*
+         * 终止符必须连续出现。异常帧中的单个0xFF不应让下一包被误判
+         * 为完整响应；该字节本身也不是数值响应的有效内容。
+         */
+        _responseTerminatorCount = 0;
+        if (_responseLength < sizeof(_response))
+            _response[_responseLength++] = value;
+        else
+            _responseLength = 0;
+    }
+}
+
+void NextionMissionDisplay::processResponse()
+{
+    // Nextion数值返回：0x71 + uint32小端值 + 0xFF 0xFF 0xFF。
+    if (_responseLength != 5 || _response[0] != 0x71)
+        return;
+
+    const uint32_t value =
+        static_cast<uint32_t>(_response[1]) |
+        (static_cast<uint32_t>(_response[2]) << 8) |
+        (static_cast<uint32_t>(_response[3]) << 16) |
+        (static_cast<uint32_t>(_response[4]) << 24);
+
+    _selectedStartZone = value == 1
+                             ? StartZone::UpperRight
+                             : StartZone::LowerRight;
+    _hasStartZoneSelection = true;
 }
 
 void NextionMissionDisplay::updateState()

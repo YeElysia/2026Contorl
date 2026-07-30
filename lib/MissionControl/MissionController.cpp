@@ -27,6 +27,7 @@ void MissionController::begin(uint32_t startupDelayMs)
     memset(&_plan, 0, sizeof(_plan));
     _round = 0;
     _startRequested = false;
+    _scanPlanReady = false;
     _startupDelayMs = startupDelayMs;
     _startupStartedMs = millis();
     _faultMessage = "";
@@ -106,6 +107,22 @@ void MissionController::abort()
     fail("mission aborted");
 }
 
+bool MissionController::selectStartZone(StartZone zone)
+{
+    /*
+     * 启停区只允许在发车前修改。运行途中改变会让返程目标与实际
+     * 出发位置不一致，因此直接拒绝。
+     */
+    if (_state != State::Startup &&
+        _state != State::WaitingForStart)
+    {
+        return false;
+    }
+
+    _startZone = zone;
+    return true;
+}
+
 MissionController::State MissionController::state() const
 {
     return _state;
@@ -114,6 +131,11 @@ MissionController::State MissionController::state() const
 uint8_t MissionController::round() const
 {
     return _round;
+}
+
+StartZone MissionController::startZone() const
+{
+    return _startZone;
 }
 
 bool MissionController::running() const
@@ -134,6 +156,11 @@ bool MissionController::faulted() const
     return _state == State::Fault;
 }
 
+bool MissionController::startPending() const
+{
+    return _startRequested;
+}
+
 const char *MissionController::faultMessage() const
 {
     return _faultMessage;
@@ -144,9 +171,7 @@ void MissionController::updateStartup()
     if (millis() - _startupStartedMs < _startupDelayMs)
         return;
 
-    if (!_stationTask.ready())
-        return;
-
+    // 机械臂保持上电初始化位，运输收纳动作改在扫码区启动。
     _state = State::WaitingForStart;
 }
 
@@ -157,8 +182,10 @@ void MissionController::updateWaitingForStart()
 
     _startRequested = false;
     _round = 0;
+    _scanPlanReady = false;
 
-    if (!startRouteWithTravelPreparation(
+    // 首段只移动底盘，机械臂到达扫码区后再从初始化位切到收纳位。
+    if (!startRoute(
             ROUTE_TO_SCAN,
             State::MovingToScan))
         fail("failed to start route to scan station");
@@ -186,24 +213,41 @@ void MissionController::updateRouteState()
 
 void MissionController::updateScanning()
 {
-    switch (_missionData.result())
+    if (!_scanPlanReady)
     {
-    case AsyncResult::Succeeded:
-        _plan = _missionData.plan();
-        if (!startRoute(
-                ROUTE_SCAN_TO_MATERIAL,
-                State::MovingToMaterial))
+        switch (_missionData.result())
         {
-            fail("failed to start route to material station");
+        case AsyncResult::Succeeded:
+            _plan = _missionData.plan();
+            if (!validateStackingPlan())
+            {
+                fail("mission stacking color mapping invalid");
+                return;
+            }
+            _scanPlanReady = true;
+            break;
+
+        case AsyncResult::Failed:
+            fail("QR mission data invalid");
+            return;
+
+        default:
+            return;
         }
-        break;
+    }
 
-    case AsyncResult::Failed:
-        fail("QR mission data invalid");
-        break;
+    /*
+     * 扫码和机械臂收纳同时进行。二维码先读完时留在扫码区等待，
+     * 避免机械臂尚未达到安全运输位就转向原料区。
+     */
+    if (_stationTask.result() == AsyncResult::Running)
+        return;
 
-    default:
-        break;
+    if (!startRoute(
+            ROUTE_SCAN_TO_MATERIAL,
+            State::MovingToMaterial))
+    {
+        fail("failed to start route to material station");
     }
 }
 
@@ -247,7 +291,8 @@ bool MissionController::startRoute(
 
 bool MissionController::startRouteWithTravelPreparation(
     RouteDefinition route,
-    State routeState)
+    State routeState,
+    TravelDestination destination)
 {
     if (!startRoute(route, routeState))
         return false;
@@ -256,7 +301,7 @@ bool MissionController::startRouteWithTravelPreparation(
      * 路线已经启动后再发机构收纳命令，两者从同一次update开始并行。
      * 若机构拒绝动作，立即取消刚启动的路线，保持故障处理原子性。
      */
-    if (!_stationTask.prepareForTravel())
+    if (!_stationTask.prepareForTravel(destination))
     {
         _route.cancel();
         return false;
@@ -269,11 +314,101 @@ bool MissionController::startAlignment(
     Station station,
     State alignmentState)
 {
-    if (!_alignment.start(station, _round))
+    AlignmentRequest request;
+    request.station = station;
+    request.round = _round;
+    if (station == Station::Storage && _round == 1)
+        request.referenceColor = storageReferenceColor();
+
+    if (!_alignment.start(request))
         return false;
 
     _state = alignmentState;
     return true;
+}
+
+bool MissionController::validateStackingPlan() const
+{
+    const BatchMission &first = _plan.batches[0];
+    const BatchMission &second = _plan.batches[1];
+    uint8_t storageReferenceCount = 0;
+
+    for (uint8_t firstIndex = 0;
+         firstIndex < MATERIALS_PER_BATCH;
+         ++firstIndex)
+    {
+        if (first.colors[firstIndex] < 1 ||
+            first.colors[firstIndex] > 4 ||
+            second.colors[firstIndex] < 1 ||
+            second.colors[firstIndex] > 4 ||
+            first.storagePositions[firstIndex] < 1 ||
+            first.storagePositions[firstIndex] > 3)
+        {
+            return false;
+        }
+
+        if (first.storagePositions[firstIndex] == 2)
+            ++storageReferenceCount;
+
+        for (uint8_t other = firstIndex + 1;
+             other < MATERIALS_PER_BATCH;
+             ++other)
+        {
+            if (first.colors[firstIndex] == first.colors[other] ||
+                second.colors[firstIndex] == second.colors[other] ||
+                first.storagePositions[firstIndex] ==
+                    first.storagePositions[other])
+            {
+                return false;
+            }
+        }
+    }
+
+    if (storageReferenceCount != 1)
+        return false;
+
+    /*
+     * 第二批每个物料必须能在第一批找到唯一同色物料，并且其码垛
+     * 位置必须等于第一批同色物料的暂存位置。
+     */
+    for (uint8_t secondIndex = 0;
+         secondIndex < MATERIALS_PER_BATCH;
+         ++secondIndex)
+    {
+        uint8_t matchingFirstCount = 0;
+        uint8_t expectedPosition = 0;
+        for (uint8_t firstIndex = 0;
+             firstIndex < MATERIALS_PER_BATCH;
+             ++firstIndex)
+        {
+            if (second.colors[secondIndex] ==
+                first.colors[firstIndex])
+            {
+                ++matchingFirstCount;
+                expectedPosition =
+                    first.storagePositions[firstIndex];
+            }
+        }
+
+        if (matchingFirstCount != 1 ||
+            second.storagePositions[secondIndex] != expectedPosition)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+uint8_t MissionController::storageReferenceColor() const
+{
+    const BatchMission &first = _plan.batches[0];
+    for (uint8_t i = 0; i < MATERIALS_PER_BATCH; ++i)
+    {
+        if (first.storagePositions[i] == 2)
+            return first.colors[i];
+    }
+    return 0;
 }
 
 bool MissionController::startStationTask(
@@ -298,14 +433,23 @@ void MissionController::onRouteCompleted()
     {
     case State::MovingToScan:
         /*
-         * 到达扫码区后才启动扫描，避免途中误读场地上的其他二维码。
-         * start()之后由Scanning状态持续等待异步结果。
+         * 到达扫码区后同时启动扫描和机构收纳：途中不会误读二维码，
+         * 出发时机械臂也保持上电初始化位。
          */
+        if (!_stationTask.prepareForTravel(
+                TravelDestination::Material))
+        {
+            fail("failed to prepare mechanism at scan station");
+            break;
+        }
+        _scanPlanReady = false;
         _missionData.start();
         _state = State::Scanning;
         break;
 
     case State::MovingToMaterial:
+        if (_stationTask.result() == AsyncResult::Running)
+            return;
         if (!startAlignment(
                 Station::Material,
                 State::AligningMaterial))
@@ -313,6 +457,8 @@ void MissionController::onRouteCompleted()
         break;
 
     case State::MovingToRoughProcessing:
+        if (_stationTask.result() == AsyncResult::Running)
+            return;
         if (!startAlignment(
                 Station::RoughProcessing,
                 State::AligningRoughProcessing))
@@ -320,6 +466,8 @@ void MissionController::onRouteCompleted()
         break;
 
     case State::MovingToStorage:
+        if (_stationTask.result() == AsyncResult::Running)
+            return;
         if (!startAlignment(
                 Station::Storage,
                 State::AligningStorage))
@@ -384,14 +532,16 @@ void MissionController::onStationTaskCompleted()
     case State::CollectingMaterial:
         if (!startRouteWithTravelPreparation(
                 ROUTE_MATERIAL_TO_ROUGH[_round],
-                State::MovingToRoughProcessing))
+                State::MovingToRoughProcessing,
+                TravelDestination::RoughProcessing))
             fail("failed to leave material task");
         break;
 
     case State::RoughProcessing:
         if (!startRouteWithTravelPreparation(
                 ROUTE_ROUGH_TO_STORAGE[_round],
-                State::MovingToStorage))
+                State::MovingToStorage,
+                TravelDestination::Storage))
             fail("failed to leave rough-process task");
         break;
 
@@ -401,14 +551,16 @@ void MissionController::onStationTaskCompleted()
             _round = 1;
             if (!startRouteWithTravelPreparation(
                     ROUTE_STORAGE_TO_MATERIAL_SECOND,
-                    State::MovingToMaterial))
+                    State::MovingToMaterial,
+                    TravelDestination::Material))
                 fail("failed to start second round");
         }
         else
         {
             if (!startRouteWithTravelPreparation(
-                    ROUTE_STORAGE_TO_HOME,
-                    State::ReturningHome))
+                    storageToHomeRoute(_startZone),
+                    State::ReturningHome,
+                    TravelDestination::Home))
                 fail("failed to start return-home route");
         }
         break;

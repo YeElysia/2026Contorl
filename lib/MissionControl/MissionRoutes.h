@@ -44,8 +44,13 @@ constexpr RouteAction preciseTo(const FieldPose &pose)
  * 离站路线首先以精确档返回当前区域基准位置。基准航向在上一次
  * 中心转向时已经确定，作业期间由IMU保持，不在区域内原地旋转。
  */
-constexpr FieldPose HOME_ANCHOR = {
-    {field_config::START_X_MM, field_config::START_Y_MM},
+constexpr FieldPose LOWER_HOME_ANCHOR = {
+    {field_config::LOWER_RIGHT_START.xMm,
+     field_config::LOWER_RIGHT_START.yMm},
+    -180.0F};
+constexpr FieldPose UPPER_HOME_ANCHOR = {
+    {field_config::UPPER_RIGHT_START.xMm,
+     field_config::UPPER_RIGHT_START.yMm},
     -180.0F};
 constexpr FieldPose SCAN_ANCHOR = {
     {field_config::TURN_CENTER_X_MM, field_config::TURN_CENTER_Y_MM},
@@ -75,7 +80,7 @@ constexpr FieldPoint TURN_CENTER = {
  * 同时为机械臂和场地边界留出明确的安全距离。
  */
 constexpr FieldPoint HOME_CENTERLINE = {
-    field_config::START_X_MM,
+    field_config::LOWER_RIGHT_START.xMm,
     field_config::TURN_CENTER_Y_MM};
 constexpr FieldPoint CENTER_FROM_HOME = {1150.0F, 1200.0F};
 constexpr FieldPoint CENTER_FROM_MATERIAL = {1200.0F, 1250.0F};
@@ -84,9 +89,12 @@ constexpr FieldPoint CENTER_FROM_STORAGE = {1250.0F, 1200.0F};
 constexpr FieldPoint MATERIAL_APPROACH = {1200.0F, 2090.0F};
 constexpr FieldPoint ROUGH_APPROACH = {1200.0F, 360.0F};
 constexpr FieldPoint STORAGE_APPROACH = {2050.0F, 1200.0F};
-constexpr FieldPoint HOME_APPROACH = {
-    field_config::START_X_MM,
-    field_config::START_Y_MM + 50.0F};
+constexpr FieldPoint LOWER_HOME_APPROACH = {
+    field_config::LOWER_RIGHT_START.xMm,
+    field_config::LOWER_RIGHT_START.yMm + 50.0F};
+constexpr FieldPoint UPPER_HOME_APPROACH = {
+    field_config::UPPER_RIGHT_START.xMm,
+    field_config::UPPER_RIGHT_START.yMm - 50.0F};
 
 // 启停区 -> 扫码区，扫码区与中心转向点重合。
 constexpr RouteAction TO_SCAN[] = {
@@ -136,15 +144,26 @@ constexpr RouteAction STORAGE_TO_MATERIAL_SECOND[] = {
     preciseTo(MATERIAL_ANCHOR),
 };
 
-// 暂存区 -> 启停区，保持-180度航向，不在终点旋转。
-constexpr RouteAction STORAGE_TO_HOME[] = {
+// 暂存区 -> 右下启停区，保持-180度航向，不在终点旋转。
+constexpr RouteAction STORAGE_TO_LOWER_HOME[] = {
     preciseTo(STORAGE_ANCHOR),
     preciseTo(STORAGE_APPROACH),
     fastTo(CENTER_FROM_STORAGE),
     preciseTo(TURN_CENTER),
     fastTo(HOME_CENTERLINE),
-    fastTo(HOME_APPROACH),
-    preciseTo(HOME_ANCHOR),
+    fastTo(LOWER_HOME_APPROACH),
+    preciseTo(LOWER_HOME_ANCHOR),
+};
+
+// 暂存区 -> 右上启停区，与右下路线共用右侧中心线。
+constexpr RouteAction STORAGE_TO_UPPER_HOME[] = {
+    preciseTo(STORAGE_ANCHOR),
+    preciseTo(STORAGE_APPROACH),
+    fastTo(CENTER_FROM_STORAGE),
+    preciseTo(TURN_CENTER),
+    fastTo(HOME_CENTERLINE),
+    fastTo(UPPER_HOME_APPROACH),
+    preciseTo(UPPER_HOME_ANCHOR),
 };
 
 constexpr RouteDefinition ROUTE_TO_SCAN = routeDefinition(TO_SCAN);
@@ -158,6 +177,13 @@ constexpr RouteDefinition ROUTE_ROUGH_TO_STORAGE[BATCH_COUNT] = {
     routeDefinition(ROUGH_TO_STORAGE)};
 constexpr RouteDefinition ROUTE_STORAGE_TO_MATERIAL_SECOND =
     routeDefinition(STORAGE_TO_MATERIAL_SECOND);
-constexpr RouteDefinition ROUTE_STORAGE_TO_HOME =
-    routeDefinition(STORAGE_TO_HOME);
+constexpr RouteDefinition ROUTE_STORAGE_TO_HOME[] = {
+    routeDefinition(STORAGE_TO_LOWER_HOME),
+    routeDefinition(STORAGE_TO_UPPER_HOME)};
+
+constexpr RouteDefinition storageToHomeRoute(StartZone zone)
+{
+    return ROUTE_STORAGE_TO_HOME[
+        zone == StartZone::UpperRight ? 1 : 0];
+}
 } // namespace mission_routes

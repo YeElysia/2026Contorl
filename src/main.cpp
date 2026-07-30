@@ -10,7 +10,9 @@
 #include "NextionMissionDisplay.h"
 #include "QRCodeMissionProvider.h"
 #include "RouteExecutor.h"
+#include "StartupDiagnostics.h"
 #include "chassis_config.h"
+#include "debug_config.h"
 #include "field_config.h"
 #include "mechanism_config.h"
 #include "mission_config.h"
@@ -39,6 +41,9 @@ namespace
     HardwareSerial serialMechanismServo(
         mechanism_config::SERVO_RX_PIN,
         mechanism_config::SERVO_TX_PIN);
+    HardwareSerial serialDebug(
+        debug_config::RX_PIN,
+        debug_config::TX_PIN);
 
     ChassisControl chassis(&serialImu);
     GraspForwardPositioner graspForwardPositioner(chassis);
@@ -50,7 +55,7 @@ namespace
         mission_config::QR_TIMEOUT_MS);
     maixcam::MaixCamV2 camera(serialVision);
     MaixProGraspVision graspVision(camera);
-    MaixProRingAlignment alignment(camera, chassis);
+    MaixProRingAlignment alignment(camera, graspVision, chassis);
     MechanismTaskExecutor stationTask(
         serialMechanismStepper,
         serialMechanismBase,
@@ -68,6 +73,14 @@ namespace
         serialScreen,
         mission,
         missionData);
+    StartupDiagnostics diagnostics(
+        serialDebug,
+        mission_config::START_BUTTON_PIN,
+        mission,
+        routeExecutor,
+        chassis,
+        alignment,
+        stationTask);
 
     OneButton startButton(
         mission_config::START_BUTTON_PIN,
@@ -76,6 +89,30 @@ namespace
 
     void onStartButtonClicked()
     {
+        diagnostics.noteButtonClick();
+
+        /*
+         * 发车瞬间锁定串口屏选择，并以对应启停区重建世界坐标。
+         * n4尚未返回时使用安全默认值0（右下启停区）。
+         */
+        if (mission.state() == MissionController::State::Startup ||
+            mission.state() ==
+                MissionController::State::WaitingForStart)
+        {
+            const StartZone zone = display.selectedStartZone();
+            diagnostics.noteStartZoneSelection(
+                zone,
+                display.hasStartZoneSelection());
+            mission.selectStartZone(zone);
+
+            const field_config::StartPose pose =
+                field_config::startPose(zone);
+            chassis.resetWorldPose(
+                pose.xMm,
+                pose.yMm,
+                pose.yawDeg);
+        }
+
         mission.requestStart();
     }
 
@@ -101,7 +138,7 @@ namespace
 
 void setup()
 {
-    delay(1000); // 等待电源稳定，避免启动时电压下降导致串口初始化失败。
+    delay(4000); // 等待电源稳定，避免启动时电压下降导致串口初始化失败。
     pinMode(mission_config::STATUS_LED_PIN, OUTPUT);
     digitalWrite(mission_config::STATUS_LED_PIN, LOW);
 
@@ -120,6 +157,7 @@ void setup()
     camera.begin(vision_config::BAUD);
     missionData.begin();
     mission.begin(mission_config::STARTUP_STABLE_MS);
+    diagnostics.begin(debug_config::BAUD);
     stationTask.begin();
     display.begin(
         mission_config::SCREEN_BAUD,
@@ -134,9 +172,12 @@ void loop()
      * - MissionController推进路线、视觉和机构任务；
      * - OneButton处理按键消抖。
      */
+    // 按键必须优先扫描，避免机构串口查询拉长循环后漏掉短按。
+    startButton.tick();
     chassis.update();
     mission.update();
-    startButton.tick();
+    diagnostics.update(
+        debug_config::STARTUP_REPORT_INTERVAL_MS);
     display.update();
     updateStatusLed();
 }
