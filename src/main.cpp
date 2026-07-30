@@ -11,6 +11,7 @@
 #include "QRCodeMissionProvider.h"
 #include "RouteExecutor.h"
 #include "chassis_config.h"
+#include "field_config.h"
 #include "mechanism_config.h"
 #include "mission_config.h"
 #include "vision_config.h"
@@ -108,6 +109,14 @@ void setup()
     startButton.attachClick(onStartButtonClicked);
 
     chassis.begin();
+    /*
+     * 底盘内部记录的是场地绝对坐标。此时IMU可能尚未输出首帧，
+     * resetWorldPose会保留初始航向，收到首帧后自动建立航向零点。
+     */
+    chassis.resetWorldPose(
+        field_config::START_X_MM,
+        field_config::START_Y_MM,
+        field_config::START_YAW_DEG);
     camera.begin(vision_config::BAUD);
     missionData.begin();
     mission.begin(mission_config::STARTUP_STABLE_MS);
