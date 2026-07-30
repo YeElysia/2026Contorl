@@ -11,7 +11,8 @@
  * @brief 非阻塞机械臂工位任务执行器。
  *
  * 高层只提交“取料/粗加工/码垛”任务。本类把任务展开成基础动作表，
- * 每次update只发送一次命令或轮询一次状态，不使用delay和wait。
+ * 同一动作组中的独立执行器并行运动，动作组之间保持必要的安全顺序。
+ * 每次update只下发命令或轮询状态，不使用delay和阻塞wait。
  */
 class MechanismTaskExecutor : public IStationTaskExecutor
 {
@@ -49,7 +50,6 @@ private:
         Extend,
         RotateBase,
         RotateStorage,
-        WaitStorage,
         OpenGripper,
         OpenGripperMax,
         CloseGripper
@@ -59,7 +59,14 @@ private:
     {
         StepKind kind;
         float target;
-        uint16_t waitMs;
+        uint8_t group;
+        bool issued;
+        bool completed;
+        uint32_t startedMs;
+        uint32_t lastPollMs;
+        uint8_t stableFeedbackCount;
+        float previousFeedbackAngle;
+        bool hasPreviousFeedback;
     };
 
     enum class TaskPhase : uint8_t
@@ -95,10 +102,9 @@ private:
     ActionStep _steps[MAX_ACTION_STEPS] = {};
     uint8_t _stepCount = 0;
     uint8_t _stepIndex = 0;
-    bool _stepIssued = false;
-    uint32_t _stepStartedMs = 0;
-    uint32_t _lastPollMs = 0;
-    uint32_t _storageReadyMs = 0;
+    uint8_t _nextStepGroup = 0;
+    TTL_Stepper *_sharedPollOwner = nullptr;
+    uint32_t _lastSharedBusPollMs = 0;
     uint32_t _alignmentStartedMs = 0;
     uint32_t _lastObservationMs = 0;
     uint32_t _lastAlignmentCommandMs = 0;
@@ -115,7 +121,12 @@ private:
     const char *_fault = "";
 
     void clearAction();
-    void addStep(StepKind kind, float target, uint16_t waitMs = 0);
+    void addStep(StepKind kind, float target);
+    void addConcurrentStep(StepKind kind, float target);
+    void appendStep(
+        StepKind kind,
+        float target,
+        uint8_t group);
     void loadInitializationAction();
     void loadHomeAction();
     void loadTurntablePreparationAction(uint8_t traySlot);
@@ -127,12 +138,25 @@ private:
     void loadRingToStorageAction(uint8_t traySlot, uint8_t ring);
 
     bool updateCurrentStep();
+    bool updateActionStep(ActionStep &step);
     void startPickupAlignment();
     void updatePickupAlignment();
-    bool updateStepperStep(TTL_Stepper &motor, float target, bool angle);
-    void issueServoStep(const ActionStep &step);
+    bool updateStepperStep(
+        TTL_Stepper &motor,
+        ActionStep &step,
+        bool angle);
+    void pollStepperState(
+        TTL_Stepper &motor,
+        ActionStep &step,
+        uint32_t now);
+    void issueServoStep(ActionStep &step);
+    bool updateServoStep(ActionStep &step);
+    bool queryServoAngle(FSUS_Servo &servo, float &angle);
     void onActionCompleted();
     void finishStationTask();
+    const char *stepperFaultMessage(
+        const TTL_Stepper &motor,
+        bool protection) const;
     void fail(const char *message);
 
     static bool validRing(uint8_t ring);

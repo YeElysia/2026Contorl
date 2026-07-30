@@ -65,6 +65,9 @@ void MechanismTaskExecutor::begin()
     _lift.locked_state = false;
     _extension.locked_state = false;
     _base.locked_state = false;
+    _lift.loPro_state = false;
+    _extension.loPro_state = false;
+    _base.loPro_state = false;
 
     /*
      * ping用于尽早发现舵机总线接错。仅在setup阶段执行一次，
@@ -76,7 +79,6 @@ void MechanismTaskExecutor::begin()
         return;
     }
 
-    _storageServo.setSpeed(400);
     _initialized = false;
     _result = AsyncResult::Running;
     _phase = TaskPhase::Initializing;
@@ -199,22 +201,56 @@ void MechanismTaskExecutor::clearAction()
 {
     _stepCount = 0;
     _stepIndex = 0;
-    _stepIssued = false;
-    _stepStartedMs = 0;
-    _lastPollMs = 0;
+    _nextStepGroup = 0;
+    _sharedPollOwner = nullptr;
+    _lastSharedBusPollMs = 0;
 }
 
 void MechanismTaskExecutor::addStep(
     StepKind kind,
+    float target)
+{
+    appendStep(kind, target, _nextStepGroup++);
+}
+
+void MechanismTaskExecutor::addConcurrentStep(
+    StepKind kind,
+    float target)
+{
+    if (_stepCount == 0)
+    {
+        addStep(kind, target);
+        return;
+    }
+
+    appendStep(
+        kind,
+        target,
+        _steps[_stepCount - 1].group);
+}
+
+void MechanismTaskExecutor::appendStep(
+    StepKind kind,
     float target,
-    uint16_t waitMs)
+    uint8_t group)
 {
     if (_stepCount >= MAX_ACTION_STEPS)
     {
         fail("mechanism action table overflow");
         return;
     }
-    _steps[_stepCount++] = {kind, target, waitMs};
+
+    _steps[_stepCount++] = {
+        kind,
+        target,
+        group,
+        false,
+        false,
+        0,
+        0,
+        0,
+        0.0F,
+        false};
 }
 
 void MechanismTaskExecutor::loadHomeAction()
@@ -222,27 +258,24 @@ void MechanismTaskExecutor::loadHomeAction()
     clearAction();
 
     /*
-     * 载物盘舵机收到命令后会自行转动，因此先发送其目标位置，
-     * 后续升降、伸缩和底座步进动作可与载物盘同时进行。最后的
-     * WaitStorage只在其他轴先完成时补足剩余舵机运动时间。
+     * 同组动作按照加入顺序下发：先让升降轴获得上升命令，再发送
+     * 底座旋转命令。其他执行器随后启动，但整个动作组仍然并行。
      */
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[0], STORAGE_MOVE_MS);
     addStep(StepKind::Lift, LIFT_HOME);
-    addStep(StepKind::Extend, EXTENSION_HOME);
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE, GRIPPER_MOVE_MS);
-    addStep(StepKind::RotateBase, BASE_HOME);
-    addStep(StepKind::WaitStorage, 0.0F);
+    addConcurrentStep(StepKind::RotateBase, BASE_HOME);
+    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+    addConcurrentStep(StepKind::RotateStorage, STORAGE_ANGLE[0]);
+    addConcurrentStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 }
 
 void MechanismTaskExecutor::loadInitializationAction()
 {
     clearAction();
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[0], STORAGE_MOVE_MS);
     addStep(StepKind::Lift, LIFT_INITIAL);
-    addStep(StepKind::Extend, EXTENSION_INITIAL);
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE, GRIPPER_MOVE_MS);
-    addStep(StepKind::RotateBase, BASE_INITIAL);
-    addStep(StepKind::WaitStorage, 0.0F);
+    addConcurrentStep(StepKind::RotateBase, BASE_INITIAL);
+    addConcurrentStep(StepKind::Extend, EXTENSION_INITIAL);
+    addConcurrentStep(StepKind::RotateStorage, STORAGE_ANGLE[0]);
+    addConcurrentStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 }
 
 void MechanismTaskExecutor::loadTurntablePreparationAction(uint8_t traySlot)
@@ -250,29 +283,33 @@ void MechanismTaskExecutor::loadTurntablePreparationAction(uint8_t traySlot)
     clearAction();
 
     /*
-     * 先启动载物盘，再转动机械臂底座。载物盘舵机与三个步进轴
-     * 相互独立，底座旋转期间载物盘会同步到达本次使用的槽位。
+     * 先发送升降上升命令，再发送底座旋转命令；载物盘和夹爪
+     * 随后启动，四个执行器仍属于同一个并行动作组。
      */
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot], STORAGE_MOVE_MS);
     addStep(StepKind::Lift, LIFT_HOME);
-    addStep(StepKind::RotateBase, BASE_TURNTABLE);
-    addStep(StepKind::OpenGripperMax, GRIPPER_OPEN_MAX_ANGLE, GRIPPER_MOVE_MS);
+    addConcurrentStep(StepKind::RotateBase, BASE_TURNTABLE);
+    addConcurrentStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot]);
+    addConcurrentStep(StepKind::OpenGripperMax, GRIPPER_OPEN_MAX_ANGLE);
+
+    // 底座进入转盘方向后再伸出，避免长臂扫过车体结构。
     addStep(StepKind::Extend, EXTENSION_TURNTABLE);
-    addStep(StepKind::WaitStorage, 0.0F);
 }
 
 void MechanismTaskExecutor::loadTurntablePickupToStorageAction()
 {
     clearAction();
     addStep(StepKind::Lift, LIFT_TURNTABLE);
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE, GRIPPER_MOVE_MS);
+    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+
+    // 夹紧后先发送上升命令，再让底座同步转向车内载物盘。
     addStep(StepKind::Lift, LIFT_HOME);
-    addStep(StepKind::Extend, EXTENSION_HOME);
-    addStep(StepKind::RotateBase, BASE_STORAGE);
+    addConcurrentStep(StepKind::RotateBase, BASE_STORAGE);
+    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+
+    // 底座到达车内方向后再进入精确的载物盘伸缩位置。
     addStep(StepKind::Extend, EXTENSION_STORAGE);
-    addStep(StepKind::WaitStorage, 0.0F);
     addStep(StepKind::Lift, LIFT_STORAGE);
-    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE, GRIPPER_MOVE_MS);
+    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
     addStep(StepKind::Lift, LIFT_HOME);
 }
 
@@ -397,24 +434,33 @@ void MechanismTaskExecutor::loadStorageToRingAction(
     uint8_t stackLevel)
 {
     clearAction();
-    // 载物盘先异步旋转，同时准备底座、伸缩轴和夹爪。
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot], STORAGE_MOVE_MS);
-    addStep(StepKind::RotateBase, BASE_STORAGE);
-    addStep(StepKind::Extend, EXTENSION_STORAGE);
-    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE, GRIPPER_MOVE_MS);
-    addStep(StepKind::WaitStorage, 0.0F);
+    // 车内取料准备互不干涉，载物盘、底座、伸缩轴和夹爪同时动作。
+    addStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot]);
+    addConcurrentStep(StepKind::RotateBase, BASE_STORAGE);
+    addConcurrentStep(StepKind::Extend, EXTENSION_STORAGE);
+    addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
     addStep(StepKind::Lift, LIFT_STORAGE);
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE, GRIPPER_MOVE_MS);
+    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+
+    /*
+     * 物料夹紧后，升降轴上抬、伸缩轴回收和底座转向圆环可并行。
+     * 用户已确认底座旋转与升降抬升不存在机械干涉。
+     */
     addStep(StepKind::Lift, LIFT_HOME);
-    addStep(StepKind::RotateBase, RING_BASE_ANGLE[ring]);
+    addConcurrentStep(StepKind::RotateBase, RING_BASE_ANGLE[ring]);
+    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+
+    // 底座到达圆环方向后才允许伸出长臂。
     addStep(StepKind::Extend, RING_EXTENSION[ring]);
     addStep(
         StepKind::Lift,
         LIFT_GROUND - stackLevel * MATERIAL_HEIGHT);
-    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE, GRIPPER_MOVE_MS);
+    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
+
+    // 离开圆环时三个步进轴同时回到安全运输方向。
     addStep(StepKind::Lift, LIFT_HOME);
-    addStep(StepKind::Extend, EXTENSION_HOME);
-    addStep(StepKind::RotateBase, BASE_STORAGE);
+    addConcurrentStep(StepKind::RotateBase, BASE_STORAGE);
+    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
 }
 
 void MechanismTaskExecutor::loadRingToStorageAction(
@@ -422,19 +468,24 @@ void MechanismTaskExecutor::loadRingToStorageAction(
     uint8_t ring)
 {
     clearAction();
-    addStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot], STORAGE_MOVE_MS);
-    addStep(StepKind::RotateBase, RING_BASE_ANGLE[ring]);
-    addStep(StepKind::OpenGripperMax, GRIPPER_OPEN_MAX_ANGLE, GRIPPER_MOVE_MS);
+    addStep(StepKind::RotateStorage, STORAGE_ANGLE[traySlot]);
+    addConcurrentStep(StepKind::RotateBase, RING_BASE_ANGLE[ring]);
+    addConcurrentStep(StepKind::OpenGripperMax, GRIPPER_OPEN_MAX_ANGLE);
+
+    // 底座到达圆环方向后再伸出。
     addStep(StepKind::Extend, RING_EXTENSION[ring]);
     addStep(StepKind::Lift, LIFT_GROUND);
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE, GRIPPER_MOVE_MS);
+    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+
+    // 从圆环抬起时同步回收长臂并转向车内载物盘。
     addStep(StepKind::Lift, LIFT_HOME);
-    addStep(StepKind::Extend, EXTENSION_HOME);
-    addStep(StepKind::RotateBase, BASE_STORAGE);
+    addConcurrentStep(StepKind::RotateBase, BASE_STORAGE);
+    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+
+    // 确认底座已进入车内方向后再移动到载物盘取放位置。
     addStep(StepKind::Extend, EXTENSION_STORAGE);
-    addStep(StepKind::WaitStorage, 0.0F);
     addStep(StepKind::Lift, LIFT_STORAGE);
-    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE, GRIPPER_MOVE_MS);
+    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
     addStep(StepKind::Lift, LIFT_HOME);
 }
 
@@ -445,115 +496,279 @@ bool MechanismTaskExecutor::updateCurrentStep()
     if (_stepIndex >= _stepCount)
         return true;
 
-    const ActionStep &step = _steps[_stepIndex];
-    bool completed = false;
+    const uint8_t activeGroup = _steps[_stepIndex].group;
+    bool groupCompleted = true;
 
+    for (uint8_t i = _stepIndex;
+         i < _stepCount && _steps[i].group == activeGroup;
+         ++i)
+    {
+        ActionStep &step = _steps[i];
+        if (!step.completed)
+            step.completed = updateActionStep(step);
+        if (!step.completed)
+            groupCompleted = false;
+    }
+
+    if (!groupCompleted || _result == AsyncResult::Failed)
+        return false;
+
+    do
+    {
+        ++_stepIndex;
+    } while (
+        _stepIndex < _stepCount &&
+        _steps[_stepIndex].group == activeGroup);
+
+    return _stepIndex >= _stepCount;
+}
+
+bool MechanismTaskExecutor::updateActionStep(ActionStep &step)
+{
     switch (step.kind)
     {
     case StepKind::Lift:
-        completed = updateStepperStep(_lift, step.target, false);
-        break;
+        return updateStepperStep(_lift, step, false);
+
     case StepKind::Extend:
-        completed = updateStepperStep(_extension, step.target, false);
-        break;
+        return updateStepperStep(_extension, step, false);
+
     case StepKind::RotateBase:
-        completed = updateStepperStep(_base, step.target, true);
-        break;
+        return updateStepperStep(_base, step, true);
+
     case StepKind::RotateStorage:
-        if (!_stepIssued)
-            issueServoStep(step);
-        // 只负责发送目标角度，不在此处等待舵机到位。
-        completed = true;
-        break;
-    case StepKind::WaitStorage:
-        completed =
-            static_cast<int32_t>(millis() - _storageReadyMs) >= 0;
-        break;
     case StepKind::OpenGripper:
     case StepKind::OpenGripperMax:
     case StepKind::CloseGripper:
-        if (!_stepIssued)
-            issueServoStep(step);
-        completed = millis() - _stepStartedMs >= step.waitMs;
-        break;
+        return updateServoStep(step);
     }
 
-    if (!completed || _result == AsyncResult::Failed)
-        return false;
-
-    ++_stepIndex;
-    _stepIssued = false;
-    _stepStartedMs = 0;
-    _lastPollMs = 0;
-    return _stepIndex >= _stepCount;
+    return false;
 }
 
 bool MechanismTaskExecutor::updateStepperStep(
     TTL_Stepper &motor,
-    float target,
+    ActionStep &step,
     bool angle)
 {
     const uint32_t now = millis();
-    if (!_stepIssued)
+    if (!step.issued)
     {
         motor.recDate_Clear();
         motor.onPos_state = false;
         motor.locked_state = false;
+        motor.loPro_state = false;
         if (angle)
-            motor.setAngle(target);
+            motor.setAngle(step.target);
         else
-            motor.runToNewPosition(target);
+            motor.runToNewPosition(step.target);
 
-        _stepIssued = true;
-        _stepStartedMs = now;
-        _lastPollMs = 0;
+        step.issued = true;
+        step.startedMs = now;
+        step.lastPollMs = 0;
         return false;
     }
 
-    if (now - _stepStartedMs >= STEPPER_TIMEOUT_MS)
+    if (now - step.startedMs >= STEPPER_TIMEOUT_MS)
     {
         fail("mechanism stepper timeout");
         return false;
     }
 
-    if (_lastPollMs == 0 || now - _lastPollMs >= STEPPER_POLL_MS)
+    pollStepperState(motor, step, now);
+
+    if (motor.locked_state)
     {
-        _lastPollMs = now;
-        motor.state_update();
+        fail(stepperFaultMessage(motor, false));
+        return false;
     }
 
-    if (motor.locked_state || motor.loPro_state)
+    if (motor.loPro_state)
     {
-        fail("mechanism stepper locked");
+        fail(stepperFaultMessage(motor, true));
         return false;
     }
     return motor.onPos_state;
 }
 
-void MechanismTaskExecutor::issueServoStep(const ActionStep &step)
+void MechanismTaskExecutor::pollStepperState(
+    TTL_Stepper &motor,
+    ActionStep &step,
+    uint32_t now)
 {
-    _stepIssued = true;
-    _stepStartedMs = millis();
+    /*
+     * 升降和伸缩共用一条TTL串口。供应商库的state_update()在发起
+     * 查询时会清空串口缓存，因此必须让一次查询完整收发结束后，
+     * 才能查询同总线的另一台电机。运动命令已经同时下发，这里的
+     * 轮流操作只影响状态查询频率，不影响两个电机并行运动。
+     */
+    const bool sharedBusMotor =
+        &motor == &_lift || &motor == &_extension;
+
+    if (sharedBusMotor)
+    {
+        if (_sharedPollOwner != nullptr &&
+            _sharedPollOwner != &motor)
+        {
+            return;
+        }
+
+        if (now - _lastSharedBusPollMs < STEPPER_POLL_MS)
+            return;
+
+        if (_sharedPollOwner == nullptr)
+            _sharedPollOwner = &motor;
+
+        _lastSharedBusPollMs = now;
+        motor.state_update();
+
+        // Ask_State清零表示该电机的应答已经完整解析。
+        if (!motor.Ask_State)
+            _sharedPollOwner = nullptr;
+        return;
+    }
+
+    if (step.lastPollMs != 0 &&
+        now - step.lastPollMs < STEPPER_POLL_MS)
+        return;
+
+    step.lastPollMs = now;
+    motor.state_update();
+}
+
+void MechanismTaskExecutor::issueServoStep(ActionStep &step)
+{
+    step.issued = true;
+    step.startedMs = millis();
+    step.lastPollMs = 0;
+    step.stableFeedbackCount = 0;
+    step.previousFeedbackAngle = 0.0F;
+    step.hasPreviousFeedback = false;
 
     switch (step.kind)
     {
     case StepKind::RotateStorage:
-        _storageServo.setAngle(step.target, step.waitMs);
-        _storageReadyMs = _stepStartedMs + step.waitMs;
+        _storageServo.setRawAngleByVelocity(
+            _storageServo.angleReal2Raw(step.target),
+            STORAGE_SPEED_DPS,
+            0,
+            0,
+            0);
         break;
     case StepKind::OpenGripper:
     case StepKind::OpenGripperMax:
-        _gripperServo.setAngle(step.target, step.waitMs, 0);
+        _gripperServo.setRawAngleByVelocity(
+            _gripperServo.angleReal2Raw(step.target),
+            GRIPPER_SPEED_DPS,
+            0,
+            0,
+            0);
         break;
     case StepKind::CloseGripper:
-        _gripperServo.setAngle(
-            step.target,
-            step.waitMs,
+        _gripperServo.setRawAngleByVelocity(
+            _gripperServo.angleReal2Raw(step.target),
+            GRIPPER_SPEED_DPS,
+            0,
+            0,
             GRIPPER_MAX_POWER);
         break;
     default:
         break;
     }
+}
+
+bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
+{
+    if (!step.issued)
+    {
+        issueServoStep(step);
+        return false;
+    }
+
+    const uint32_t now = millis();
+    if (now - step.startedMs >= SERVO_TIMEOUT_MS)
+    {
+        fail(step.kind == StepKind::RotateStorage
+                 ? "storage servo feedback timeout"
+                 : "gripper servo feedback timeout");
+        return false;
+    }
+
+    if (step.lastPollMs != 0 &&
+        now - step.lastPollMs < SERVO_POLL_MS)
+    {
+        return false;
+    }
+    step.lastPollMs = now;
+
+    FSUS_Servo &servo =
+        step.kind == StepKind::RotateStorage
+            ? _storageServo
+            : _gripperServo;
+    float actualAngle = 0.0F;
+    if (!queryServoAngle(servo, actualAngle))
+    {
+        step.stableFeedbackCount = 0;
+        return false;
+    }
+
+    const float tolerance =
+        step.kind == StepKind::RotateStorage
+            ? STORAGE_POSITION_TOLERANCE_DEG
+            : GRIPPER_POSITION_TOLERANCE_DEG;
+    bool reached = abs(actualAngle - step.target) <= tolerance;
+    const bool angleStopped =
+        step.hasPreviousFeedback &&
+        abs(actualAngle - step.previousFeedbackAngle) <=
+            GRIPPER_STALL_ANGLE_DELTA_DEG;
+    step.previousFeedbackAngle = actualAngle;
+    step.hasPreviousFeedback = true;
+
+    if (step.kind == StepKind::CloseGripper && !reached)
+    {
+        /*
+         * 夹住物料后，夹爪本来就不应继续到空载闭合角度。
+         * 实际角度确认夹爪已经离开张开端，再用功率判断是否形成
+         * 有效夹持；通信失败返回0，不会被误判成夹紧成功。
+         */
+        const uint16_t power = _gripperServo.queryPower();
+        const bool powerValid =
+            _servoProtocol.responsePack.recv_status ==
+            FSUS_STATUS_SUCCESS;
+        reached =
+            powerValid &&
+            actualAngle >= GRIPPER_LOAD_MIN_ANGLE &&
+            angleStopped &&
+            power >= GRIPPER_LOAD_POWER_MW;
+    }
+
+    if (reached)
+    {
+        if (step.stableFeedbackCount < SERVO_STABLE_FEEDBACK_COUNT)
+            ++step.stableFeedbackCount;
+    }
+    else
+    {
+        step.stableFeedbackCount = 0;
+    }
+
+    return step.stableFeedbackCount >=
+           SERVO_STABLE_FEEDBACK_COUNT;
+}
+
+bool MechanismTaskExecutor::queryServoAngle(
+    FSUS_Servo &servo,
+    float &angle)
+{
+    angle = servo.queryAngle();
+    const uint8_t status = _servoProtocol.responsePack.recv_status;
+
+    /*
+     * 供应商协议解析器在校验和异常时仍会解析完整角度帧，
+     * 因此允许该状态参与后续的连续两帧确认。其他错误一律重试。
+     */
+    return status == FSUS_STATUS_SUCCESS ||
+           status == FSUS_STATUS_CHECKSUM_ERROR;
 }
 
 void MechanismTaskExecutor::onActionCompleted()
@@ -654,6 +869,25 @@ void MechanismTaskExecutor::finishStationTask()
     _phase = TaskPhase::Idle;
     _result = AsyncResult::Succeeded;
     clearAction();
+}
+
+const char *MechanismTaskExecutor::stepperFaultMessage(
+    const TTL_Stepper &motor,
+    bool protection) const
+{
+    if (&motor == &_lift)
+        return protection
+                   ? "lift stepper protection"
+                   : "lift stepper locked";
+
+    if (&motor == &_extension)
+        return protection
+                   ? "extension stepper protection"
+                   : "extension stepper locked";
+
+    return protection
+               ? "base stepper protection"
+               : "base stepper locked";
 }
 
 void MechanismTaskExecutor::fail(const char *message)
