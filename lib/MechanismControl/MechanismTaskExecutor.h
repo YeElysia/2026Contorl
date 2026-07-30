@@ -4,6 +4,7 @@
 #include <FashionStar_UartServo.h>
 #include <TTL_STEPPER.h>
 
+#include "GraspMotionPorts.h"
 #include "GraspVisionPorts.h"
 #include "MissionPorts.h"
 #include "mechanism_config.h"
@@ -22,7 +23,8 @@ public:
         HardwareSerial &stepperSerial,
         HardwareSerial &baseSerial,
         HardwareSerial &servoSerial,
-        IGraspVisionProvider &graspVision);
+        IGraspVisionProvider &graspVision,
+        IGraspForwardPositioner &forwardPositioner);
 
     /**
      * @brief 初始化总线并让机构到达上电初始位置。
@@ -77,6 +79,7 @@ private:
         CollectPreparing,
         CollectAligning,
         CollectDepositing,
+        CollectReturningToRoute,
         RoughPlacing,
         RoughRetrieving,
         FinalStoring,
@@ -89,6 +92,7 @@ private:
     HardwareSerial &_baseSerial;
     HardwareSerial &_servoSerial;
     IGraspVisionProvider &_graspVision;
+    IGraspForwardPositioner &_forwardPositioner;
 
     TTL_Protocol _stepperProtocol;
     TTL_Protocol _baseProtocol;
@@ -110,8 +114,9 @@ private:
     uint32_t _lastObservationMs = 0;
     uint32_t _alignmentObservationAfterMs = 0;
     uint8_t _stableFrames = 0;
-    float _alignmentBaseTarget = 0.0F;
+    float _alignmentForwardOffset = 0.0F;
     float _alignmentExtensionTarget = 0.0F;
+    bool _forwardCommandActive = false;
 
     TaskPhase _phase = TaskPhase::Idle;
     BatchMission _batch = {};
@@ -146,6 +151,8 @@ private:
     bool updateActionStep(ActionStep &step);
     void startPickupAlignment();
     void updatePickupAlignment();
+    void startReturnToMaterialRouteAnchor();
+    void updateReturnToMaterialRouteAnchor();
     bool updateStepperStep(
         TTL_Stepper &motor,
         ActionStep &step,

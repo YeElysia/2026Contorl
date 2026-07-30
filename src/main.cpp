@@ -2,6 +2,7 @@
 #include <OneButton.h>
 
 #include "ChassisControl.h"
+#include "GraspForwardPositioner.h"
 #include "MissionController.h"
 #include "MaixProGraspVision.h"
 #include "MaixProRingAlignment.h"
@@ -39,6 +40,7 @@ namespace
         mechanism_config::SERVO_TX_PIN);
 
     ChassisControl chassis(&serialImu);
+    GraspForwardPositioner graspForwardPositioner(chassis);
     RouteExecutor routeExecutor(chassis);
 
     QRCodeMissionProvider missionData(
@@ -52,7 +54,8 @@ namespace
         serialMechanismStepper,
         serialMechanismBase,
         serialMechanismServo,
-        graspVision);
+        graspVision,
+        graspForwardPositioner);
 
     MissionController mission(
         routeExecutor,

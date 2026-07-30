@@ -9,11 +9,13 @@ MechanismTaskExecutor::MechanismTaskExecutor(
     HardwareSerial &stepperSerial,
     HardwareSerial &baseSerial,
     HardwareSerial &servoSerial,
-    IGraspVisionProvider &graspVision)
+    IGraspVisionProvider &graspVision,
+    IGraspForwardPositioner &forwardPositioner)
     : _stepperSerial(stepperSerial),
       _baseSerial(baseSerial),
       _servoSerial(servoSerial),
       _graspVision(graspVision),
+      _forwardPositioner(forwardPositioner),
       _stepperProtocol(&stepperSerial, BUS_BAUD),
       _baseProtocol(&baseSerial, BUS_BAUD),
       _lift(LIFT_STEPPER_ID, &_stepperProtocol),
@@ -113,6 +115,8 @@ bool MechanismTaskExecutor::start(
     _round = round;
     _batch = batch;
     _itemIndex = 0;
+    _alignmentForwardOffset = 0.0F;
+    _forwardCommandActive = false;
     _result = AsyncResult::Running;
     _fault = "";
 
@@ -157,6 +161,12 @@ void MechanismTaskExecutor::update()
         return;
     }
 
+    if (_phase == TaskPhase::CollectReturningToRoute)
+    {
+        updateReturnToMaterialRouteAnchor();
+        return;
+    }
+
     if (updateCurrentStep())
         onActionCompleted();
 }
@@ -169,6 +179,8 @@ AsyncResult MechanismTaskExecutor::result() const
 void MechanismTaskExecutor::cancel()
 {
     _graspVision.stop();
+    if (_forwardCommandActive)
+        _forwardPositioner.stop();
 
     if (_result == AsyncResult::Running)
     {
@@ -178,6 +190,7 @@ void MechanismTaskExecutor::cancel()
     }
 
     clearAction();
+    _forwardCommandActive = false;
     _phase = TaskPhase::Idle;
     _result = AsyncResult::Idle;
 }
@@ -313,7 +326,6 @@ void MechanismTaskExecutor::startPickupAlignment()
     _alignmentStartedMs = millis();
     _lastObservationMs = 0;
     _alignmentObservationAfterMs = _alignmentStartedMs;
-    _alignmentBaseTarget = BASE_TURNTABLE;
     _alignmentExtensionTarget = EXTENSION_TURNTABLE;
 
     if (!_graspVision.startTracking(_batch.colors[_itemIndex]))
@@ -336,6 +348,12 @@ void MechanismTaskExecutor::updatePickupAlignment()
         return;
     }
 
+    if (_forwardPositioner.faulted())
+    {
+        fail("material forward positioning failed");
+        return;
+    }
+
     if (now - _alignmentStartedMs >= TARGET_SEARCH_TIMEOUT_MS)
     {
         fail("grasp target search timeout");
@@ -343,16 +361,22 @@ void MechanismTaskExecutor::updatePickupAlignment()
     }
 
     /*
-     * 每次根据图像计算出底座和伸缩目标后，先等待两个电机实际
-     * 到位，再使用到位后的新图像继续精调。这样既能一次大步移动，
-     * 又不会因相机延迟连续累加尚未执行完的修正量。
+     * 每次根据图像计算出底盘前后和伸缩目标后，先等待二者实际
+     * 到位，再使用到位后的新图像继续精调。底盘接口不提供左右
+     * 横移能力，朝转盘方向的误差只能由伸缩轴消除。
      */
-    if (_stepCount > 0)
+    if (_stepCount > 0 || _forwardCommandActive)
     {
-        if (!updateCurrentStep())
+        const bool armCompleted =
+            _stepCount == 0 || updateCurrentStep();
+        const bool chassisCompleted =
+            !_forwardCommandActive ||
+            !_forwardPositioner.busy();
+        if (!armCompleted || !chassisCompleted)
             return;
 
         clearAction();
+        _forwardCommandActive = false;
         _alignmentObservationAfterMs = millis();
         _lastObservationMs = 0;
         return;
@@ -406,9 +430,9 @@ void MechanismTaskExecutor::updatePickupAlignment()
 
     _stableFrames = 0;
 
-    float baseDelta =
-        BASE_FROM_DX * errorDx +
-        BASE_FROM_DY * errorDy;
+    float forwardDelta =
+        FORWARD_FROM_DX * errorDx +
+        FORWARD_FROM_DY * errorDy;
     float extensionDelta =
         EXTENSION_FROM_DX * errorDx +
         EXTENSION_FROM_DY * errorDy;
@@ -416,37 +440,44 @@ void MechanismTaskExecutor::updatePickupAlignment()
     const bool fineAlignment =
         abs(errorDx) <= FINE_ALIGNMENT_ZONE_PX &&
         abs(errorDy) <= FINE_ALIGNMENT_ZONE_PX;
-    const float baseLimit =
+    const float forwardLimit =
         fineAlignment
-            ? FINE_BASE_MAX_DELTA
-            : COARSE_BASE_MAX_DELTA;
+            ? FINE_FORWARD_MAX_DELTA_MM
+            : COARSE_FORWARD_MAX_DELTA_MM;
     const float extensionLimit =
         fineAlignment
             ? FINE_EXTENSION_MAX_DELTA
             : COARSE_EXTENSION_MAX_DELTA;
 
-    baseDelta = clampValue(
-        baseDelta,
-        -baseLimit,
-        baseLimit);
+    forwardDelta = clampValue(
+        forwardDelta,
+        -forwardLimit,
+        forwardLimit);
     extensionDelta = clampValue(
         extensionDelta,
         -extensionLimit,
         extensionLimit);
 
-    const float nextBaseTarget = clampValue(
-        _alignmentBaseTarget + baseDelta,
-        PICKUP_BASE_MIN,
-        PICKUP_BASE_MAX);
+    const float nextForwardOffset = clampValue(
+        _alignmentForwardOffset + forwardDelta,
+        PICKUP_FORWARD_MIN_OFFSET_MM,
+        PICKUP_FORWARD_MAX_OFFSET_MM);
     const float nextExtensionTarget = clampValue(
         _alignmentExtensionTarget + extensionDelta,
         PICKUP_EXTENSION_MIN,
         PICKUP_EXTENSION_MAX);
 
-    if (fabsf(nextBaseTarget - _alignmentBaseTarget) > 0.1F)
+    const float forwardMove =
+        nextForwardOffset - _alignmentForwardOffset;
+    if (fabsf(forwardMove) > 0.1F)
     {
-        _alignmentBaseTarget = nextBaseTarget;
-        addStep(StepKind::RotateBase, _alignmentBaseTarget);
+        if (!_forwardPositioner.moveForward(forwardMove))
+        {
+            fail("material forward correction rejected");
+            return;
+        }
+        _alignmentForwardOffset = nextForwardOffset;
+        _forwardCommandActive = true;
     }
 
     if (fabsf(
@@ -454,15 +485,54 @@ void MechanismTaskExecutor::updatePickupAlignment()
             _alignmentExtensionTarget) > 0.1F)
     {
         _alignmentExtensionTarget = nextExtensionTarget;
-        if (_stepCount == 0)
-            addStep(
-                StepKind::Extend,
-                _alignmentExtensionTarget);
-        else
-            addConcurrentStep(
-                StepKind::Extend,
-                _alignmentExtensionTarget);
+        addStep(
+            StepKind::Extend,
+            _alignmentExtensionTarget);
     }
+
+    if (!_forwardCommandActive && _stepCount == 0)
+    {
+        fail("material alignment reached safe limit");
+    }
+}
+
+void MechanismTaskExecutor::startReturnToMaterialRouteAnchor()
+{
+    _graspVision.stop();
+    clearAction();
+
+    if (fabsf(_alignmentForwardOffset) <= 0.1F)
+    {
+        _alignmentForwardOffset = 0.0F;
+        finishStationTask();
+        return;
+    }
+
+    if (!_forwardPositioner.moveForward(
+            -_alignmentForwardOffset))
+    {
+        fail("failed to return material route anchor");
+        return;
+    }
+
+    _forwardCommandActive = true;
+    _phase = TaskPhase::CollectReturningToRoute;
+}
+
+void MechanismTaskExecutor::updateReturnToMaterialRouteAnchor()
+{
+    if (_forwardPositioner.faulted())
+    {
+        fail("material route-anchor return failed");
+        return;
+    }
+
+    if (_forwardPositioner.busy())
+        return;
+
+    _forwardCommandActive = false;
+    _alignmentForwardOffset = 0.0F;
+    finishStationTask();
 }
 
 void MechanismTaskExecutor::loadStorageToRingAction(
@@ -835,12 +905,16 @@ void MechanismTaskExecutor::onActionCompleted()
         }
         else
         {
-            finishStationTask();
+            startReturnToMaterialRouteAnchor();
         }
         break;
 
     case TaskPhase::CollectAligning:
         fail("unexpected grasp alignment completion");
+        break;
+
+    case TaskPhase::CollectReturningToRoute:
+        fail("unexpected route-anchor action completion");
         break;
 
     case TaskPhase::RoughPlacing:
@@ -942,6 +1016,8 @@ const char *MechanismTaskExecutor::stepperCommandFaultMessage(
 void MechanismTaskExecutor::fail(const char *message)
 {
     _graspVision.stop();
+    if (_forwardCommandActive)
+        _forwardPositioner.stop();
     // 故障发生在任务update内部时，主状态机尚未来得及调用cancel。
     // 在这里立即停车，避免超时或堵转后电机继续保持运动命令。
     _stepperProtocol.Emm_V5_Stop_Now(LIFT_STEPPER_ID, false);
@@ -949,6 +1025,7 @@ void MechanismTaskExecutor::fail(const char *message)
     _baseProtocol.Emm_V5_Stop_Now(BASE_STEPPER_ID, false);
 
     _fault = message;
+    _forwardCommandActive = false;
     _phase = TaskPhase::Idle;
     _result = AsyncResult::Failed;
     clearAction();

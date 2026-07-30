@@ -81,6 +81,32 @@ private:
     uint32_t _lastObservationMs = 0;
 };
 
+/**
+ * @brief 机构独立测试中的底盘前后微调替身。
+ *
+ * 居中视觉不会实际提交移动；保留本替身用于验证正式接口接线。
+ */
+class ImmediateTestForwardPositioner : public IGraspForwardPositioner
+{
+public:
+    bool moveForward(float) override
+    {
+        return true;
+    }
+
+    bool busy() const override
+    {
+        return false;
+    }
+
+    bool faulted() const override
+    {
+        return false;
+    }
+
+    void stop() override {}
+};
+
 enum class TestStage : uint8_t
 {
     TravelPreparation,
@@ -101,11 +127,13 @@ HardwareSerial serialMechanismServo(
     mechanism_config::SERVO_TX_PIN);
 
 CenteredTestVision testVision;
+ImmediateTestForwardPositioner testForwardPositioner;
 MechanismTaskExecutor mechanism(
     serialMechanismStepper,
     serialMechanismBase,
     serialMechanismServo,
-    testVision);
+    testVision,
+    testForwardPositioner);
 OneButton testButton(
     mission_config::START_BUTTON_PIN,
     true,
