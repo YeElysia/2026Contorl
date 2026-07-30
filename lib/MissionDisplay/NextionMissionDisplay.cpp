@@ -176,17 +176,30 @@ void NextionMissionDisplay::showState(
         break;
 
     case MissionController::State::WaitingForStart:
-        sendCommand("page DEBUG");
         setText("DEBUG.t4", "Ready");
         break;
 
-    case MissionController::State::Finished:
+    case MissionController::State::MovingToScan:
         /*
-         * 兼容new_project：先在运行页写入done，再切换结束页。
-         * 若HMI工程没有END页，可删除下面的page命令。
+         * 实体按键启动任务后只在这里进入一次RUN页。后续运行状态
+         * 只更新文本，不再重复加载页面，避免清空任务码。
+         */
+        sendCommand("page RUN");
+        setText("RUN.t1", stateText(state));
+        break;
+
+    case MissionController::State::ReturningHome:
+        /*
+         * 第二批垛码完成后，状态机立即启动返程并进入本状态。
+         * 此时任务动作已经全部完成，直接切换结束页；返程期间不再
+         * 切回RUN页。
          */
         setText("RUN.t1", "done");
         sendCommand("page END");
+        break;
+
+    case MissionController::State::Finished:
+        // ReturningHome阶段已经切换到END页，最终到位不重复切页。
         break;
 
     case MissionController::State::Fault:
@@ -196,7 +209,6 @@ void NextionMissionDisplay::showState(
         break;
 
     default:
-        sendCommand("page RUN");
         setText("RUN.t1", stateText(state));
         break;
     }
