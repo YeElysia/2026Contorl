@@ -79,6 +79,18 @@ public:
         float maxRpm,
         float accelerationRpmPerS);
 
+    /**
+     * @brief 移动到世界坐标系中的绝对位置。
+     *
+     * 执行时根据当前估计位姿计算世界坐标差值，再转换为车体
+     * 坐标运动。适合比赛主路线和区域基准点，不用于视觉小步微调。
+     */
+    bool moveWorldTo(
+        float targetWorldXMm,
+        float targetWorldYMm,
+        float maxRpm,
+        float accelerationRpmPerS);
+
     bool rotateTo(float absoluteYawDeg);
     bool rotateWorldTo(float worldYawDeg);
     void stop();

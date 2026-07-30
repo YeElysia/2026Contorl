@@ -7,7 +7,7 @@
 
 enum class RouteActionType : uint8_t
 {
-    Move,
+    MoveTo,
     RotateTo
 };
 
@@ -20,13 +20,13 @@ enum class MotionProfile : uint8_t
 /**
  * @brief 一条不可变的底盘动作。
  *
- * Move使用forwardMm/rightMm；RotateTo只使用yawDeg。
+ * MoveTo使用世界绝对坐标xMm/yMm；RotateTo只使用世界yawDeg。
  */
 struct RouteAction
 {
     RouteActionType type;
-    float forwardMm;
-    float rightMm;
+    float xMm;
+    float yMm;
     float yawDeg;
     MotionProfile profile;
 };
@@ -44,24 +44,24 @@ constexpr RouteDefinition routeDefinition(
     return {actions, N};
 }
 
-constexpr RouteAction routeMove(float forwardMm, float rightMm)
+constexpr RouteAction routeMoveTo(float xMm, float yMm)
 {
     return {
-        RouteActionType::Move,
-        forwardMm,
-        rightMm,
+        RouteActionType::MoveTo,
+        xMm,
+        yMm,
         0.0f,
         MotionProfile::Fast};
 }
 
-constexpr RouteAction routePreciseMove(
-    float forwardMm,
-    float rightMm)
+constexpr RouteAction routePreciseMoveTo(
+    float xMm,
+    float yMm)
 {
     return {
-        RouteActionType::Move,
-        forwardMm,
-        rightMm,
+        RouteActionType::MoveTo,
+        xMm,
+        yMm,
         0.0f,
         MotionProfile::Precise};
 }

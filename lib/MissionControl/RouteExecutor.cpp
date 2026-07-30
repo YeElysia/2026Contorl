@@ -52,7 +52,7 @@ void RouteExecutor::update()
 
     switch (action.type)
     {
-    case RouteActionType::Move:
+    case RouteActionType::MoveTo:
     {
         float maximumRpm = chassis_config::DRIVE_RPM;
         float accelerationRpmPerS =
@@ -65,9 +65,9 @@ void RouteExecutor::update()
                 chassis_config::PRECISE_DRIVE_ACCEL_RPM_PER_S;
         }
 
-        accepted = _chassis.moveBodyRelative(
-            action.forwardMm,
-            action.rightMm,
+        accepted = _chassis.moveWorldTo(
+            action.xMm,
+            action.yMm,
             maximumRpm,
             accelerationRpmPerS);
         break;

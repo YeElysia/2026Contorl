@@ -4,75 +4,151 @@
 
 namespace mission_routes
 {
-/*
- * 所有底盘点位集中在本文件。
+/**
+ * @brief 场地中的世界坐标点，单位为毫米。
  *
- * 坐标约定：
- *   routeMove(forward, right)
- *   forward > 0 前进，right > 0 右移。
- *
- * 修改比赛点位时只调整这些数组，不修改MissionController。
+ * 原点为启动位置，+x指向小车初始左侧，+y指向初始车头。
+ * 所有比赛点位集中在本文件，实车标定时不修改状态机。
  */
+struct FieldPoint
+{
+    float xMm;
+    float yMm;
+};
+
+struct FieldPose
+{
+    FieldPoint position;
+    float yawDeg;
+};
+
+constexpr RouteAction fastTo(const FieldPoint &point)
+{
+    return routeMoveTo(point.xMm, point.yMm);
+}
+
+constexpr RouteAction preciseTo(const FieldPoint &point)
+{
+    return routePreciseMoveTo(point.xMm, point.yMm);
+}
+
+constexpr RouteAction preciseTo(const FieldPose &pose)
+{
+    return preciseTo(pose.position);
+}
+
+constexpr RouteAction face(const FieldPose &pose)
+{
+    return routeRotateTo(pose.yawDeg);
+}
+
+/*
+ * 区域基准点。
+ *
+ * 每个工位任务完成后，离站路线首先以精确档返回对应基准点，
+ * 清除视觉微调造成的坐标偏移，然后才执行固定长距离路线。
+ */
+constexpr FieldPose SCAN_ANCHOR = {{1015.0F, 1050.0F}, 0.0F};
+constexpr FieldPose MATERIAL_ANCHOR = {{1015.0F, 1990.0F}, 90.0F};
+constexpr FieldPose ROUGH_ANCHOR = {{1045.0F, 160.0F}, -90.0F};
+constexpr FieldPose STORAGE_ANCHOR = {{1915.0F, 1090.0F}, -180.0F};
+constexpr FieldPose HOME_ANCHOR = {{0.0F, 0.0F}, -180.0F};
 
 // 启停区 -> 扫码区
+constexpr FieldPoint START_FORWARD_WAYPOINT = {0.0F, 1050.0F};
 constexpr RouteAction TO_SCAN[] = {
-    routeMove(1050.0f, 0.0f),
-    routeMove(0.0f, -1015.0f),
+    fastTo(START_FORWARD_WAYPOINT),
+    fastTo(SCAN_ANCHOR.position),
 };
 
 // 扫码区 -> 原料区（第一轮）
 constexpr RouteAction SCAN_TO_MATERIAL[] = {
-    routeRotateTo(90.0f),
-    routeMove(0.0f, 940.0f),
+    preciseTo(SCAN_ANCHOR),
+    face(SCAN_ANCHOR),
+    routeRotateTo(90.0F),
+    fastTo(MATERIAL_ANCHOR.position),
 };
 
 // 原料区 -> 粗加工区（第一轮）
+constexpr FieldPoint MATERIAL_FIRST_CORNER = {1015.0F, 1010.0F};
+constexpr FieldPoint ROUGH_FIRST_APPROACH = {1015.0F, 160.0F};
 constexpr RouteAction MATERIAL_TO_ROUGH_FIRST[] = {
-    routeMove(0.0f, -980.0f),
-    routeRotateTo(-90.0f),
-    routeMove(0.0f, 850.0f),
-    routePreciseMove(-30.0f, 0.0f),
+    preciseTo(MATERIAL_ANCHOR),
+    face(MATERIAL_ANCHOR),
+    fastTo(MATERIAL_FIRST_CORNER),
+    routeRotateTo(-90.0F),
+    fastTo(ROUGH_FIRST_APPROACH),
+    preciseTo(ROUGH_ANCHOR),
 };
 
 // 粗加工区 -> 暂存区（第一轮）
+constexpr FieldPoint ROUGH_FIRST_DEPARTURE = {1015.0F, 160.0F};
+constexpr FieldPoint STORAGE_FIRST_CORNER = {1015.0F, 1040.0F};
+constexpr FieldPoint STORAGE_FIRST_APPROACH = {1915.0F, 1040.0F};
 constexpr RouteAction ROUGH_TO_STORAGE_FIRST[] = {
-    routePreciseMove(30.0f, 0.0f),
-    routeMove(0.0f, -880.0f),
-    routeRotateTo(-180.0f),
-    routeMove(0.0f, 900.0f),
-    routePreciseMove(-50.0f, 0.0f),
+    preciseTo(ROUGH_ANCHOR),
+    face(ROUGH_ANCHOR),
+    preciseTo(ROUGH_FIRST_DEPARTURE),
+    fastTo(STORAGE_FIRST_CORNER),
+    routeRotateTo(-180.0F),
+    fastTo(STORAGE_FIRST_APPROACH),
+    preciseTo(STORAGE_ANCHOR),
 };
 
 // 暂存区 -> 原料区（第二轮）
+constexpr FieldPoint STORAGE_SECOND_DEPARTURE = {1915.0F, 1040.0F};
+constexpr FieldPoint MATERIAL_SECOND_CORNER = {1035.0F, 1040.0F};
+constexpr FieldPoint MATERIAL_SECOND_APPROACH = {1035.0F, 1990.0F};
 constexpr RouteAction STORAGE_TO_MATERIAL_SECOND[] = {
-    routePreciseMove(50.0f, 0.0f),
-    routeMove(0.0f, -880.0f),
-    routeRotateTo(90.0f),
-    routeMove(0.0f, 950.0f),
-    routePreciseMove(-30.0f, 0.0f),
+    preciseTo(STORAGE_ANCHOR),
+    face(STORAGE_ANCHOR),
+    preciseTo(STORAGE_SECOND_DEPARTURE),
+    fastTo(MATERIAL_SECOND_CORNER),
+    routeRotateTo(90.0F),
+    fastTo(MATERIAL_SECOND_APPROACH),
+    preciseTo(MATERIAL_ANCHOR),
 };
 
 // 原料区 -> 粗加工区（第二轮）
+constexpr FieldPoint MATERIAL_SECOND_DEPARTURE = {1045.0F, 1990.0F};
+constexpr FieldPoint ROUGH_SECOND_APPROACH = {1045.0F, 150.0F};
 constexpr RouteAction MATERIAL_TO_ROUGH_SECOND[] = {
-    routePreciseMove(30.0f, 0.0f),
-    routeMove(0.0f, -1840.0f),
-    routeRotateTo(-90.0f),
+    preciseTo(MATERIAL_ANCHOR),
+    face(MATERIAL_ANCHOR),
+    preciseTo(MATERIAL_SECOND_DEPARTURE),
+    fastTo(ROUGH_SECOND_APPROACH),
+    routeRotateTo(-90.0F),
+    preciseTo(ROUGH_ANCHOR),
 };
 
 // 粗加工区 -> 暂存区（第二轮）
+constexpr FieldPoint ROUGH_SECOND_CORNER = {1045.0F, 1060.0F};
+constexpr FieldPoint STORAGE_SECOND_APPROACH_RIGHT = {1945.0F, 1060.0F};
+constexpr FieldPoint STORAGE_SECOND_APPROACH = {1915.0F, 1060.0F};
 constexpr RouteAction ROUGH_TO_STORAGE_SECOND[] = {
-    routeMove(0.0f, -900.0f),
-    routeRotateTo(-180.0f),
-    routeMove(0.0f, 900.0f),
-    routePreciseMove(-20.0f, 0.0f),
+    preciseTo(ROUGH_ANCHOR),
+    face(ROUGH_ANCHOR),
+    fastTo(ROUGH_SECOND_CORNER),
+    routeRotateTo(-180.0F),
+    fastTo(STORAGE_SECOND_APPROACH_RIGHT),
+    preciseTo(STORAGE_SECOND_APPROACH),
+    preciseTo(STORAGE_ANCHOR),
 };
 
 // 暂存区 -> 启停区
+constexpr FieldPoint HOME_DEPARTURE = {1915.0F, 1070.0F};
+constexpr FieldPoint HOME_FIRST_CORNER = {1915.0F, 220.0F};
+constexpr FieldPoint HOME_SECOND_CORNER = {-35.0F, 220.0F};
+constexpr FieldPoint HOME_APPROACH = {-35.0F, -20.0F};
 constexpr RouteAction STORAGE_TO_HOME[] = {
-    routePreciseMove(20.0f, 0.0f),
-    routeMove(850.0f, 0.0f),
-    routeMove(0.0f, -1950.0f),
-    routePreciseMove(240.0f, 0.0f),
+    preciseTo(STORAGE_ANCHOR),
+    face(STORAGE_ANCHOR),
+    preciseTo(HOME_DEPARTURE),
+    fastTo(HOME_FIRST_CORNER),
+    fastTo(HOME_SECOND_CORNER),
+    preciseTo(HOME_APPROACH),
+    preciseTo(HOME_ANCHOR),
+    face(HOME_ANCHOR),
 };
 
 constexpr RouteDefinition ROUTE_TO_SCAN = routeDefinition(TO_SCAN);

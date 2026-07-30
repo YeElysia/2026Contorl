@@ -173,6 +173,12 @@ bool ChassisControl::moveWorldRelative(
     float maxRpm,
     float accelerationRpmPerS)
 {
+    if (!_worldYawReady)
+    {
+        setFault("world move rejected: pose yaw not ready");
+        return false;
+    }
+
     float forwardMm = 0.0F;
     float rightMm = 0.0F;
     worldToBody(
@@ -184,6 +190,19 @@ bool ChassisControl::moveWorldRelative(
     return moveBodyRelative(
         forwardMm,
         rightMm,
+        maxRpm,
+        accelerationRpmPerS);
+}
+
+bool ChassisControl::moveWorldTo(
+    float targetWorldXMm,
+    float targetWorldYMm,
+    float maxRpm,
+    float accelerationRpmPerS)
+{
+    return moveWorldRelative(
+        targetWorldXMm - _worldPose.xMm,
+        targetWorldYMm - _worldPose.yMm,
         maxRpm,
         accelerationRpmPerS);
 }
