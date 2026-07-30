@@ -1026,9 +1026,19 @@ bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
             power >= GRIPPER_LOAD_POWER_MW;
     }
 
+    const uint8_t requiredStableFeedback =
+        step.kind == StepKind::CloseGripper
+            ? GRIPPER_STABLE_FEEDBACK_COUNT
+            : SERVO_STABLE_FEEDBACK_COUNT;
+
     if (reached)
     {
-        if (step.stableFeedbackCount < SERVO_STABLE_FEEDBACK_COUNT)
+        /*
+         * 夹紧物料和普通舵机动作使用不同的连续确认帧数，计数上限
+         * 必须跟随当前动作要求。若固定限制为普通舵机的2帧，夹紧
+         * 动作要求的4帧将永远无法达到，只能等待到超时报错。
+         */
+        if (step.stableFeedbackCount < requiredStableFeedback)
             ++step.stableFeedbackCount;
     }
     else
@@ -1036,10 +1046,6 @@ bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
         step.stableFeedbackCount = 0;
     }
 
-    const uint8_t requiredStableFeedback =
-        step.kind == StepKind::CloseGripper
-            ? GRIPPER_STABLE_FEEDBACK_COUNT
-            : SERVO_STABLE_FEEDBACK_COUNT;
     return step.stableFeedbackCount >=
            requiredStableFeedback;
 }
