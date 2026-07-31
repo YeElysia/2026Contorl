@@ -51,9 +51,6 @@ private:
         static_cast<MissionController::State>(0xFF);
 
     void printSnapshot(const char *reason);
-    void printServoState(
-        const char *label,
-        const MechanismTaskExecutor::ServoDebugState &state);
     void printGraspState(
         const MechanismTaskExecutor::GraspDebugState &state);
     static const char *missionStateName(MissionController::State state);

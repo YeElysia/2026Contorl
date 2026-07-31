@@ -142,13 +142,7 @@ public:
         StationTask task,
         uint8_t round,
         const BatchMission &batch) = 0;
-    /**
-     * @brief 推进机构任务。
-     *
-     * 底盘连续行驶时可禁止阻塞式反馈读取。机械动作命令仍会立即下发，
-     * 只把舵机到位确认延后到停车后，避免打断软件产生的STEP脉冲。
-     */
-    virtual void update(bool allowBlockingFeedback = true) = 0;
+    virtual void update() = 0;
     virtual AsyncResult result() const = 0;
     virtual void cancel() = 0;
 };

@@ -22,25 +22,6 @@
 class MechanismTaskExecutor : public IStationTaskExecutor
 {
 public:
-    /**
-     * @brief 舵机动作的只读诊断快照。
-     *
-     * status是FashionStar协议状态码：0成功，8响应超时。
-     * validPolls/polls可区分“舵机未到位”和“完全没有有效反馈”。
-     */
-    struct ServoDebugState
-    {
-        float target = 0.0F;
-        float actual = 0.0F;
-        uint16_t polls = 0;
-        uint16_t validPolls = 0;
-        uint16_t power = 0;
-        uint8_t status = 0xFF;
-        bool issued = false;
-        bool hasActual = false;
-        bool hasPower = false;
-    };
-
     struct GraspDebugState
     {
         int16_t dx = 0;
@@ -72,8 +53,6 @@ public:
     bool ready() const override;
     const char *faultMessage() const override;
     const char *debugPhase() const;
-    const ServoDebugState &storageServoDebug() const;
-    const ServoDebugState &gripperServoDebug() const;
     const GraspDebugState &graspDebug() const;
     bool prepareForTravel(
         TravelDestination destination) override;
@@ -82,7 +61,7 @@ public:
         StationTask task,
         uint8_t round,
         const BatchMission &batch) override;
-    void update(bool allowBlockingFeedback = true) override;
+    void update() override;
     AsyncResult result() const override;
     void cancel() override;
 
@@ -108,10 +87,7 @@ private:
         bool completed;
         uint32_t startedMs;
         uint32_t lastPollMs;
-        uint8_t stableFeedbackCount;
         uint8_t faultFeedbackCount;
-        float previousFeedbackAngle;
-        bool hasPreviousFeedback;
     };
 
     enum class TaskPhase : uint8_t
@@ -145,8 +121,6 @@ private:
     FSUS_Protocol _servoProtocol;
     FSUS_Servo _storageServo;
     FSUS_Servo _gripperServo;
-    ServoDebugState _storageServoDebug;
-    ServoDebugState _gripperServoDebug;
     GraspDebugState _graspDebug;
 
     ActionStep _steps[MAX_ACTION_STEPS] = {};
@@ -162,7 +136,6 @@ private:
     float _alignmentForwardOffset = 0.0F;
     float _alignmentExtensionTarget = 0.0F;
     bool _forwardCommandActive = false;
-    bool _allowBlockingServoFeedback = true;
 
     TaskPhase _phase = TaskPhase::Idle;
     BatchMission _batch = {};
@@ -210,10 +183,6 @@ private:
         uint32_t now);
     void issueServoStep(ActionStep &step);
     bool updateServoStep(ActionStep &step);
-    bool queryServoAngle(
-        FSUS_Servo &servo,
-        ServoDebugState &debug,
-        float &angle);
     void onActionCompleted();
     void finishStationTask();
     const char *stepperFaultMessage(

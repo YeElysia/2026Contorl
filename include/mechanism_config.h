@@ -56,20 +56,11 @@ namespace mechanism_config
     constexpr uint16_t GRIPPER_MAX_POWER = 700;
     /*
      * 闭合过快会在夹爪尚未包住物料时将其碰飞。600ms只控制舵机
-     * 闭合速度；动作完成仍由实际角度和夹持功率反馈判断。
+     * 闭合速度；主程序只负责下发命令，不再读取舵机反馈。
      */
     constexpr uint16_t GRIPPER_COMMAND_INTERVAL_MS = 600;
     constexpr float STORAGE_SPEED_DPS = 600.0F;
 
-    // 到位反馈参数。夹紧物料时允许夹爪因接触物料而停在目标角度之前。
-    constexpr float STORAGE_POSITION_TOLERANCE_DEG = 3.0F;
-    constexpr float GRIPPER_POSITION_TOLERANCE_DEG = 4.0F;
-    constexpr uint16_t GRIPPER_LOAD_POWER_MW = 250;
-    constexpr float GRIPPER_LOAD_MIN_ANGLE = 61.0F;
-    constexpr float GRIPPER_STALL_ANGLE_DELTA_DEG = 1.5F;
-    constexpr uint8_t SERVO_STABLE_FEEDBACK_COUNT = 2;
-    // 夹紧必须持续多帧保持负载，避免接触瞬间的功率尖峰被当作成功。
-    constexpr uint8_t GRIPPER_STABLE_FEEDBACK_COUNT = 4;
     // 步进驱动偶尔会在到位瞬间短暂置位堵转标志，连续确认后才报错。
     constexpr uint8_t STEPPER_FAULT_CONFIRM_COUNT = 3;
 
@@ -149,7 +140,4 @@ namespace mechanism_config
     // -------------------- 非阻塞执行保护 --------------------
     constexpr uint32_t STEPPER_POLL_MS = 25;
     constexpr uint32_t STEPPER_TIMEOUT_MS = 15000;
-    constexpr uint32_t SERVO_POLL_MS = 60;
-    // 仅用于检测掉线或卡死，不参与正常动作完成判定。
-    constexpr uint32_t SERVO_TIMEOUT_MS = 5000;
 } // namespace mechanism_config

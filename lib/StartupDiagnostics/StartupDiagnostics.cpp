@@ -87,10 +87,6 @@ void StartupDiagnostics::printSnapshot(const char *reason)
     const char *missionFault = _mission.faultMessage();
     const char *chassisFault = _chassis.faultMessage();
     const char *mechanismFault = _mechanism.faultMessage();
-    const MechanismTaskExecutor::ServoDebugState &storage =
-        _mechanism.storageServoDebug();
-    const MechanismTaskExecutor::ServoDebugState &gripper =
-        _mechanism.gripperServoDebug();
     const MechanismTaskExecutor::GraspDebugState &grasp =
         _mechanism.graspDebug();
     const MaixProRingAlignment::DebugState &alignment =
@@ -149,8 +145,6 @@ void StartupDiagnostics::printSnapshot(const char *reason)
     _serial.print("/n");
     _serial.print(alignment.stableFrames);
     _serial.print(alignment.movePending ? "/MOVE" : "/WAIT");
-    printServoState(" storage=", storage);
-    printServoState(" gripper=", gripper);
     printGraspState(grasp);
     _serial.print(" fault=");
 
@@ -197,36 +191,6 @@ void StartupDiagnostics::printGraspState(
     _serial.print("/e");
     _serial.print(lroundf(state.extensionTarget));
     _serial.print(state.tracking ? "/RUN" : "/STOP");
-}
-
-void StartupDiagnostics::printServoState(
-    const char *label,
-    const MechanismTaskExecutor::ServoDebugState &state)
-{
-    _serial.print(label);
-    if (!state.issued)
-    {
-        _serial.print("-");
-        return;
-    }
-
-    _serial.print(lroundf(state.target));
-    _serial.print("/");
-    if (state.hasActual)
-        _serial.print(lroundf(state.actual));
-    else
-        _serial.print("NA");
-    _serial.print("/s");
-    _serial.print(state.status);
-    _serial.print("/");
-    _serial.print(state.validPolls);
-    _serial.print("/");
-    _serial.print(state.polls);
-    _serial.print("/p");
-    if (state.hasPower)
-        _serial.print(state.power);
-    else
-        _serial.print("-");
 }
 
 const char *StartupDiagnostics::missionStateName(

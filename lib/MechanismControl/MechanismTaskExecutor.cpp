@@ -113,18 +113,6 @@ const char *MechanismTaskExecutor::debugPhase() const
     return "UNKNOWN";
 }
 
-const MechanismTaskExecutor::ServoDebugState &
-MechanismTaskExecutor::storageServoDebug() const
-{
-    return _storageServoDebug;
-}
-
-const MechanismTaskExecutor::ServoDebugState &
-MechanismTaskExecutor::gripperServoDebug() const
-{
-    return _gripperServoDebug;
-}
-
 const MechanismTaskExecutor::GraspDebugState &
 MechanismTaskExecutor::graspDebug() const
 {
@@ -215,10 +203,8 @@ bool MechanismTaskExecutor::start(
     return true;
 }
 
-void MechanismTaskExecutor::update(bool allowBlockingFeedback)
+void MechanismTaskExecutor::update()
 {
-    _allowBlockingServoFeedback = allowBlockingFeedback;
-
     if (_result != AsyncResult::Running)
         return;
 
@@ -328,10 +314,7 @@ void MechanismTaskExecutor::appendStep(
         false,
         0,
         0,
-        0,
-        0,
-        0.0F,
-        false};
+        0};
 }
 
 bool MechanismTaskExecutor::lastGroupContains(StepKind kind) const
@@ -918,17 +901,6 @@ void MechanismTaskExecutor::issueServoStep(ActionStep &step)
     step.issued = true;
     step.startedMs = millis();
     step.lastPollMs = 0;
-    step.stableFeedbackCount = 0;
-    step.previousFeedbackAngle = 0.0F;
-    step.hasPreviousFeedback = false;
-
-    ServoDebugState &debug =
-        step.kind == StepKind::RotateStorage
-            ? _storageServoDebug
-            : _gripperServoDebug;
-    debug = {};
-    debug.target = step.target;
-    debug.issued = true;
 
     switch (step.kind)
     {
@@ -961,133 +933,10 @@ void MechanismTaskExecutor::issueServoStep(ActionStep &step)
 bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
 {
     if (!step.issued)
-    {
         issueServoStep(step);
-        return false;
-    }
 
-    const uint32_t now = millis();
-
-    if (!_allowBlockingServoFeedback)
-    {
-        /*
-         * FashionStar角度/功率查询内部会等待串口回复。行驶期间只延后
-         * 反馈确认，并持续刷新计时；停车后仍保留完整超时窗口检查到位。
-         */
-        step.startedMs = now;
-        step.lastPollMs = 0;
-        return false;
-    }
-
-    if (now - step.startedMs >= SERVO_TIMEOUT_MS)
-    {
-        fail(step.kind == StepKind::RotateStorage
-                 ? "storage servo feedback timeout"
-                 : "gripper servo feedback timeout");
-        return false;
-    }
-
-    if (step.lastPollMs != 0 &&
-        now - step.lastPollMs < SERVO_POLL_MS)
-    {
-        return false;
-    }
-    step.lastPollMs = now;
-
-    FSUS_Servo &servo =
-        step.kind == StepKind::RotateStorage
-            ? _storageServo
-            : _gripperServo;
-    ServoDebugState &debug =
-        step.kind == StepKind::RotateStorage
-            ? _storageServoDebug
-            : _gripperServoDebug;
-    float actualAngle = 0.0F;
-    if (!queryServoAngle(servo, debug, actualAngle))
-    {
-        step.stableFeedbackCount = 0;
-        return false;
-    }
-
-    const float tolerance =
-        step.kind == StepKind::RotateStorage
-            ? STORAGE_POSITION_TOLERANCE_DEG
-            : GRIPPER_POSITION_TOLERANCE_DEG;
-    bool reached = abs(actualAngle - step.target) <= tolerance;
-    const bool angleStopped =
-        step.hasPreviousFeedback &&
-        abs(actualAngle - step.previousFeedbackAngle) <=
-            GRIPPER_STALL_ANGLE_DELTA_DEG;
-    step.previousFeedbackAngle = actualAngle;
-    step.hasPreviousFeedback = true;
-
-    if (step.kind == StepKind::CloseGripper)
-    {
-        /*
-         * 搬运时不能仅凭到达空载闭合角度判定成功，否则目标偏离
-         * 夹爪时也会继续抬升。必须同时确认夹爪停止且持续形成负载。
-         */
-        const uint16_t power = _gripperServo.queryPower();
-        const bool powerValid =
-            _servoProtocol.responsePack.recv_status ==
-            FSUS_STATUS_SUCCESS;
-        debug.power = power;
-        debug.hasPower = powerValid;
-        reached =
-            powerValid &&
-            actualAngle >= GRIPPER_LOAD_MIN_ANGLE &&
-            angleStopped &&
-            power >= GRIPPER_LOAD_POWER_MW;
-    }
-
-    const uint8_t requiredStableFeedback =
-        step.kind == StepKind::CloseGripper
-            ? GRIPPER_STABLE_FEEDBACK_COUNT
-            : SERVO_STABLE_FEEDBACK_COUNT;
-
-    if (reached)
-    {
-        /*
-         * 夹紧物料和普通舵机动作使用不同的连续确认帧数，计数上限
-         * 必须跟随当前动作要求。若固定限制为普通舵机的2帧，夹紧
-         * 动作要求的4帧将永远无法达到，只能等待到超时报错。
-         */
-        if (step.stableFeedbackCount < requiredStableFeedback)
-            ++step.stableFeedbackCount;
-    }
-    else
-    {
-        step.stableFeedbackCount = 0;
-    }
-
-    return step.stableFeedbackCount >=
-           requiredStableFeedback;
-}
-
-bool MechanismTaskExecutor::queryServoAngle(
-    FSUS_Servo &servo,
-    ServoDebugState &debug,
-    float &angle)
-{
-    angle = servo.queryAngle();
-    const uint8_t status = _servoProtocol.responsePack.recv_status;
-    ++debug.polls;
-    debug.status = status;
-
-    /*
-     * 供应商协议解析器在校验和异常时仍会解析完整角度帧，
-     * 因此允许该状态参与后续的连续两帧确认。其他错误一律重试。
-     */
-    const bool valid =
-        status == FSUS_STATUS_SUCCESS ||
-        status == FSUS_STATUS_CHECKSUM_ERROR;
-    if (valid)
-    {
-        debug.actual = angle;
-        debug.hasActual = true;
-        ++debug.validPolls;
-    }
-    return valid;
+    // 不再读取角度或功率：命令写入串口后即视为舵机步骤完成。
+    return true;
 }
 
 void MechanismTaskExecutor::onActionCompleted()
