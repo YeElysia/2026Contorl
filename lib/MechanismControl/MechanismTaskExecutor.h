@@ -82,7 +82,7 @@ public:
         StationTask task,
         uint8_t round,
         const BatchMission &batch) override;
-    void update() override;
+    void update(bool allowBlockingFeedback = true) override;
     AsyncResult result() const override;
     void cancel() override;
 
@@ -162,6 +162,7 @@ private:
     float _alignmentForwardOffset = 0.0F;
     float _alignmentExtensionTarget = 0.0F;
     bool _forwardCommandActive = false;
+    bool _allowBlockingServoFeedback = true;
 
     TaskPhase _phase = TaskPhase::Idle;
     BatchMission _batch = {};

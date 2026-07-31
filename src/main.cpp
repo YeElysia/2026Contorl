@@ -177,7 +177,8 @@ void loop()
     chassis.update();
     mission.update();
     diagnostics.update(
-        debug_config::STARTUP_REPORT_INTERVAL_MS);
+        debug_config::STARTUP_REPORT_INTERVAL_MS,
+        !chassis.busy());
     display.update();
     updateStatusLed();
 }

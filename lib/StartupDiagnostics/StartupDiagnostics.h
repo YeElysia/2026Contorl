@@ -31,7 +31,9 @@ public:
     void noteStartZoneSelection(
         StartZone zone,
         bool receivedFromScreen);
-    void update(uint32_t intervalMs);
+    void update(
+        uint32_t intervalMs,
+        bool outputAllowed = true);
 
 private:
     HardwareSerial &_serial;

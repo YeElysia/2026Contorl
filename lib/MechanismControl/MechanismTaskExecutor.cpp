@@ -215,8 +215,10 @@ bool MechanismTaskExecutor::start(
     return true;
 }
 
-void MechanismTaskExecutor::update()
+void MechanismTaskExecutor::update(bool allowBlockingFeedback)
 {
+    _allowBlockingServoFeedback = allowBlockingFeedback;
+
     if (_result != AsyncResult::Running)
         return;
 
@@ -965,6 +967,18 @@ bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
     }
 
     const uint32_t now = millis();
+
+    if (!_allowBlockingServoFeedback)
+    {
+        /*
+         * FashionStar角度/功率查询内部会等待串口回复。行驶期间只延后
+         * 反馈确认，并持续刷新计时；停车后仍保留完整超时窗口检查到位。
+         */
+        step.startedMs = now;
+        step.lastPollMs = 0;
+        return false;
+    }
+
     if (now - step.startedMs >= SERVO_TIMEOUT_MS)
     {
         fail(step.kind == StepKind::RotateStorage

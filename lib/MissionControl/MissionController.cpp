@@ -39,12 +39,17 @@ void MissionController::update()
     // 各服务始终独立更新，任务状态机不承担其通信或控制细节。
     _missionData.update();
     _alignment.update();
-    _stationTask.update();
+    /*
+     * 机械动作仍与底盘路线并行下发；路线运行期间仅暂停会阻塞主循环
+     * 的舵机反馈查询，停车后立即恢复严格的到位和堵转检查。
+     */
+    _stationTask.update(
+        _route.result() != AsyncResult::Running);
     _route.update();
 
     /*
-     * 机构可能在底盘行驶期间执行收纳动作。此时发生堵转或超时
-     * 也必须立即终止整车任务，不能等到达下一个工位才发现。
+     * 机构可能在底盘行驶期间执行收纳动作。非阻塞反馈可立即报告；
+     * 舵机到位和堵转检查则按上面的调度策略在停车后恢复。
      */
     if (_state != State::Fault &&
         _stationTask.result() == AsyncResult::Failed)

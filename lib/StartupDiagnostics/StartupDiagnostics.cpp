@@ -49,23 +49,31 @@ void StartupDiagnostics::noteStartZoneSelection(
     _serial.println(receivedFromScreen ? "screen" : "default");
 }
 
-void StartupDiagnostics::update(uint32_t intervalMs)
+void StartupDiagnostics::update(
+    uint32_t intervalMs,
+    bool outputAllowed)
 {
     const int buttonLevel = digitalRead(_buttonPin);
     if (buttonLevel != _lastButtonLevel)
     {
         _lastButtonLevel = buttonLevel;
-        printSnapshot(buttonLevel == LOW
-                          ? "button_down"
-                          : "button_up");
+        if (outputAllowed)
+            printSnapshot(buttonLevel == LOW
+                              ? "button_down"
+                              : "button_up");
     }
 
     const MissionController::State missionState = _mission.state();
     if (missionState != _lastMissionState)
     {
         _lastMissionState = missionState;
-        printSnapshot("mission_state");
+        if (outputAllowed)
+            printSnapshot("mission_state");
     }
+
+    // 长诊断行会占满串口发送缓冲区，底盘行驶时不允许阻塞STEP调度。
+    if (!outputAllowed)
+        return;
 
     const uint32_t now = millis();
     if (now - _lastReportMs >= intervalMs)
