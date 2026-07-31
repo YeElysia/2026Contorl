@@ -102,7 +102,7 @@ namespace mechanism_config
     constexpr float EXTENSION_HOME = 1510.0F;
     // 从载物盘取放物料时的伸缩位置。
     constexpr float EXTENSION_TRAY_TRANSFER = 1500.0F;
-    constexpr float EXTENSION_TURNTABLE = 1250.0F;
+    constexpr float EXTENSION_TURNTABLE = 1450.0F;
 
     // 工位动作完成后，底座转到180°车内收纳方向。
     constexpr float BASE_HOME = 1800.0F;

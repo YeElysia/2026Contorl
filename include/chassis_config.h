@@ -15,7 +15,7 @@ namespace chassis_config
     constexpr uint32_t IMU_BAUD = 115200;
 
     // 机械参数。换轮或调整细分时只修改这里。
-    constexpr float WHEEL_DIAMETER_MM = 100.0f;
+    constexpr float WHEEL_DIAMETER_MM = 103.0f;
     constexpr float MOTOR_STEP_ANGLE_DEG = 1.8f;
     constexpr uint16_t MICROSTEPS = 32;
     constexpr float STEPS_PER_REV =
