@@ -135,7 +135,7 @@ bool MechanismTaskExecutor::prepareForTravel(
     }
 
     /*
-     * 初始化尚未完成时，loadHomeAction()会清除旧动作表并向各轴
+     * 初始化尚未完成时，loadTravelAction()会清除旧动作表并向各轴
      * 下发运输位目标。步进驱动支持重新设定绝对目标，无需停车等待。
      */
     _result = AsyncResult::Running;
@@ -146,7 +146,16 @@ bool MechanismTaskExecutor::prepareForTravel(
                 destination == TravelDestination::Storage
             ? LIFT_STATION_VISION
             : LIFT_HOME;
-    loadHomeAction(liftTarget);
+    /*
+     * 粗加工区和暂存区的第一个动作都从本批第一物料开始。行驶途中
+     * 预先将第一物料槽转到机械臂取放位，避免到站后再等待载物盘。
+     */
+    const uint8_t traySlot =
+        destination == TravelDestination::RoughProcessing ||
+                destination == TravelDestination::Storage
+            ? 1
+            : 0;
+    loadTravelAction(liftTarget, traySlot);
     return true;
 }
 
@@ -354,7 +363,9 @@ void MechanismTaskExecutor::addStorageDeposit()
     addStep(StepKind::Lift, LIFT_HOME);
 }
 
-void MechanismTaskExecutor::loadHomeAction(float liftTarget)
+void MechanismTaskExecutor::loadTravelAction(
+    float liftTarget,
+    uint8_t traySlot)
 {
     clearAction();
 
@@ -371,7 +382,9 @@ void MechanismTaskExecutor::loadHomeAction(float liftTarget)
 
     addStep(StepKind::RotateBase, BASE_HOME);
     addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
-    addConcurrentStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[0]);
+    addConcurrentStep(
+        StepKind::RotateStorage,
+        TRAY_SLOT_ANGLE[traySlot]);
     // 运输收纳时保持夹爪张开，避免到粗加工区后遮挡圆环视野。
     addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
 

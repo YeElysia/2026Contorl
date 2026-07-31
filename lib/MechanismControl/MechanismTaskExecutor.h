@@ -156,7 +156,9 @@ private:
     void addSafeRetraction(float baseTarget);
     void addStorageDeposit();
     void loadInitializationAction();
-    void loadHomeAction(float liftTarget);
+    void loadTravelAction(
+        float liftTarget,
+        uint8_t traySlot);
     void loadTurntablePreparationAction(uint8_t traySlot);
     void loadTurntablePickupToStorageAction();
     void loadStorageToRingAction(
