@@ -39,17 +39,12 @@ void MissionController::update()
     // 各服务始终独立更新，任务状态机不承担其通信或控制细节。
     _missionData.update();
     _alignment.update();
-    /*
-     * 机械动作仍与底盘路线并行下发；路线运行期间仅暂停会阻塞主循环
-     * 的舵机反馈查询，停车后立即恢复严格的到位和堵转检查。
-     */
-    _stationTask.update(
-        _route.result() != AsyncResult::Running);
+    _stationTask.update();
     _route.update();
 
     /*
-     * 机构可能在底盘行驶期间执行收纳动作。非阻塞反馈可立即报告；
-     * 舵机到位和堵转检查则按上面的调度策略在停车后恢复。
+     * 机构可能在底盘行驶期间执行收纳动作。步进电机等非阻塞反馈
+     * 发生故障时必须立即终止整车任务。
      */
     if (_state != State::Fault &&
         _stationTask.result() == AsyncResult::Failed)
@@ -242,12 +237,10 @@ void MissionController::updateScanning()
     }
 
     /*
-     * 扫码和机械臂收纳同时进行。二维码先读完时留在扫码区等待，
-     * 避免机械臂尚未达到安全运输位就转向原料区。
+     * 二维码读取完成后立即发车。机械臂收纳任务已经在到达扫码区时
+     * 启动，前往原料区途中继续执行；到达原料区后仍会等待其完成，
+     * 再开始视觉对准和夹取。
      */
-    if (_stationTask.result() == AsyncResult::Running)
-        return;
-
     if (!startRoute(
             ROUTE_SCAN_TO_MATERIAL,
             State::MovingToMaterial))
