@@ -3,6 +3,7 @@
 
 #include "GraspVisionPorts.h"
 #include "MechanismTaskExecutor.h"
+#include "debug_config.h"
 #include "mechanism_config.h"
 #include "mission_config.h"
 #include "vision_config.h"
@@ -12,9 +13,9 @@ namespace
 /**
  * @brief 机械臂独立测试使用的居中目标。
  *
- * 测试固件不连接MaixPro，每50 ms产生一次“目标已经居中”的观测，
- * 让正式的抓取状态机继续运行。这里只替换视觉输入，机械臂驱动、
- * 动作表、超时和堵转保护均与比赛固件完全相同。
+ * 测试固件不连接MaixPro，每50 ms产生一次观测。第一次跟踪会在
+ * 对准完成后模拟物料随转盘漂走，以验证非致命重试；第二次及后续
+ * 跟踪保持居中。这里只替换视觉输入，机构动作和保护与比赛一致。
  */
 class CenteredTestVision : public IGraspVisionProvider
 {
@@ -33,6 +34,9 @@ public:
         _tracking = true;
         _observationReady = false;
         _lastObservationMs = 0;
+        _observationCount = 0;
+        if (_trackingSession < UINT8_MAX)
+            ++_trackingSession;
         return true;
     }
 
@@ -61,6 +65,8 @@ public:
         observation.dy = vision_config::TARGET_DY_PX;
         observation.quality = 255;
         observation.receivedMs = millis();
+        if (_observationCount < UINT8_MAX)
+            ++_observationCount;
         return true;
     }
 
@@ -79,6 +85,8 @@ private:
     bool _tracking = false;
     bool _observationReady = false;
     uint32_t _lastObservationMs = 0;
+    uint8_t _trackingSession = 0;
+    uint8_t _observationCount = 0;
 };
 
 /**
@@ -89,7 +97,7 @@ private:
 class ImmediateTestForwardPositioner : public IGraspForwardPositioner
 {
 public:
-    bool moveForward(float) override
+    bool moveBodyRelative(float, float) override
     {
         return true;
     }
@@ -125,6 +133,9 @@ HardwareSerial serialMechanismBase(
 HardwareSerial serialMechanismServo(
     mechanism_config::SERVO_RX_PIN,
     mechanism_config::SERVO_TX_PIN);
+HardwareSerial serialTestDebug(
+    debug_config::RX_PIN,
+    debug_config::TX_PIN);
 
 CenteredTestVision testVision;
 ImmediateTestForwardPositioner testForwardPositioner;
@@ -148,6 +159,73 @@ TestStage stage = TestStage::TravelPreparation;
 bool actionActive = false;
 bool travelAfterStationPending = false;
 bool testFault = false;
+uint32_t lastDebugMs = 0;
+
+const char *stageName(TestStage value)
+{
+    switch (value)
+    {
+    case TestStage::TravelPreparation:
+        return "travel";
+    case TestStage::CollectMaterial:
+        return "collect";
+    case TestStage::RoughProcessing:
+        return "rough";
+    case TestStage::StoreFinishedProduct:
+        return "storage";
+    case TestStage::Completed:
+        return "completed";
+    }
+    return "unknown";
+}
+
+void updateDebugOutput()
+{
+    const uint32_t now = millis();
+    if (now - lastDebugMs < 500)
+        return;
+    lastDebugMs = now;
+
+    serialTestDebug.print("MECH_TEST t=");
+    serialTestDebug.print(now);
+    serialTestDebug.print(" stage=");
+    serialTestDebug.print(stageName(stage));
+    serialTestDebug.print(" active=");
+    serialTestDebug.print(actionActive ? 1 : 0);
+    serialTestDebug.print(" ready=");
+    serialTestDebug.print(mechanism.ready() ? 1 : 0);
+    serialTestDebug.print(" result=");
+    serialTestDebug.print(
+        static_cast<uint8_t>(mechanism.result()));
+    serialTestDebug.print(" phase=");
+    serialTestDebug.print(mechanism.debugPhase());
+    const MechanismTaskExecutor::MotionDebugState &motion =
+        mechanism.motionDebug();
+    serialTestDebug.print(" cmd=L");
+    serialTestDebug.print(motion.liftCommandCount);
+    serialTestDebug.print('@');
+    serialTestDebug.print(motion.liftTarget, 0);
+    serialTestDebug.print('/');
+    serialTestDebug.print(motion.liftIssuedMs);
+    serialTestDebug.print("/H");
+    serialTestDebug.print(motion.liftHomeConfirmedMs);
+    serialTestDebug.print(",B");
+    serialTestDebug.print(motion.baseCommandCount);
+    serialTestDebug.print('@');
+    serialTestDebug.print(motion.baseTarget, 0);
+    serialTestDebug.print('/');
+    serialTestDebug.print(motion.baseIssuedMs);
+    serialTestDebug.print(",E");
+    serialTestDebug.print(motion.extensionCommandCount);
+    serialTestDebug.print('@');
+    serialTestDebug.print(motion.extensionTarget, 0);
+    serialTestDebug.print('/');
+    serialTestDebug.print(motion.extensionIssuedMs);
+    serialTestDebug.print(" fault=");
+    const char *fault = mechanism.faultMessage();
+    serialTestDebug.println(
+        fault != nullptr && fault[0] != '\0' ? fault : "-");
+}
 
 void startCurrentStage()
 {
@@ -312,6 +390,8 @@ void setup()
 
     testButton.reset();
     testButton.attachClick(startCurrentStage);
+    serialTestDebug.begin(debug_config::BAUD);
+    serialTestDebug.println("MECH_TEST boot");
     mechanism.begin();
 }
 
@@ -321,4 +401,5 @@ void loop()
     testButton.tick();
     updateTestSequence();
     updateStatusLed();
+    updateDebugOutput();
 }

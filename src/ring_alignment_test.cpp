@@ -31,12 +31,12 @@ public:
 };
 
 /**
- * @brief 圆环测试不执行原料区前后修正，底盘端口保持空闲。
+ * @brief 圆环测试不执行原料区底盘修正，端口保持空闲。
  */
 class IdleForwardPositioner : public IGraspForwardPositioner
 {
 public:
-    bool moveForward(float) override { return false; }
+    bool moveBodyRelative(float, float) override { return false; }
     bool busy() const override { return false; }
     bool faulted() const override { return false; }
     void stop() override {}

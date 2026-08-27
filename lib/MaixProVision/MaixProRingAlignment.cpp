@@ -3,6 +3,8 @@
 #include "chassis_config.h"
 #include "vision_config.h"
 
+#include <math.h>
+
 MaixProRingAlignment::MaixProRingAlignment(
     maixcam::MaixCamV2 &camera,
     IGraspVisionProvider &graspVision,
@@ -18,6 +20,10 @@ bool MaixProRingAlignment::start(
 {
     if (_result == AsyncResult::Running)
         return false;
+
+    _allowRingFallback = false;
+    _ringFallbackActive = false;
+    _targetSeen = false;
 
     // 原料区由机械臂逐物料视觉对准，不执行额外整车对准。
     if (request.station == Station::Material)
@@ -52,6 +58,7 @@ bool MaixProRingAlignment::start(
                  static_cast<uint8_t>(MaterialColor::Green))
     {
         _useGraspVision = true;
+        _allowRingFallback = true;
         _targetMode = maixcam::MODE_GRAB;
         _targetSelector = request.referenceColor;
     }
@@ -67,6 +74,7 @@ bool MaixProRingAlignment::start(
     }
 
     const uint32_t now = millis();
+    _station = request.station;
     _movePending = false;
     _stableFrames = 0;
     _startedMs = now;
@@ -190,6 +198,15 @@ void MaixProRingAlignment::update()
 
     if (!hasDetection)
     {
+        if (_allowRingFallback &&
+            !_ringFallbackActive &&
+            !_targetSeen &&
+            now - _startedMs >= STORAGE_COLOR_FALLBACK_MS)
+        {
+            activateStorageRingFallback();
+            return;
+        }
+
         if (_lastObservationMs != 0 &&
             now - _lastObservationMs > RING_TARGET_STALE_MS)
         {
@@ -218,10 +235,20 @@ void MaixProRingAlignment::update()
     if (!detection.found ||
         detection.quality < RING_MIN_QUALITY)
     {
+        if (_allowRingFallback &&
+            !_ringFallbackActive &&
+            !_targetSeen &&
+            now - _startedMs >= STORAGE_COLOR_FALLBACK_MS)
+        {
+            activateStorageRingFallback();
+            return;
+        }
+
         _stableFrames = 0;
         _debug.stableFrames = 0;
         return;
     }
+    _targetSeen = true;
 
     const int16_t errorDx =
         detection.dx - RING_TARGET_DX_PX;
@@ -241,6 +268,11 @@ void MaixProRingAlignment::update()
 
         if (_stableFrames >= RING_REQUIRED_STABLE_FRAMES)
         {
+            if (!correctWorldPositionFromLandmark())
+            {
+                fail();
+                return;
+            }
             stopVision();
             _result = AsyncResult::Succeeded;
         }
@@ -319,6 +351,68 @@ void MaixProRingAlignment::stopVision()
         _graspVision.stop();
     else
         _camera.reset();
+}
+
+void MaixProRingAlignment::activateStorageRingFallback()
+{
+    using namespace vision_config;
+
+    if (_useGraspVision)
+        _graspVision.stop();
+
+    _useGraspVision = false;
+    _ringFallbackActive = true;
+    _targetMode = maixcam::MODE_RING;
+    _targetSelector = STORAGE_REFERENCE_RING_ID;
+    _stableFrames = 0;
+    _lastObservationMs = 0;
+    _startedMs = millis();
+    _debug.hasObservation = false;
+    _debug.found = false;
+    _debug.stableFrames = 0;
+    _debug.targetMode = _targetMode;
+    _debug.targetSelector = _targetSelector;
+    _camera.setTarget(_targetMode, _targetSelector);
+}
+
+bool MaixProRingAlignment::correctWorldPositionFromLandmark()
+{
+    using namespace vision_config;
+
+    float targetX = 0.0F;
+    float targetY = 0.0F;
+    if (_station == Station::RoughProcessing)
+    {
+        targetX = ROUGH_ALIGNED_WORLD_X_MM;
+        targetY = ROUGH_ALIGNED_WORLD_Y_MM;
+    }
+    else if (_station == Station::Storage)
+    {
+        targetX = STORAGE_ALIGNED_WORLD_X_MM;
+        targetY = STORAGE_ALIGNED_WORLD_Y_MM;
+    }
+    else
+    {
+        return true;
+    }
+
+    const ChassisControl::Pose2D pose = _chassis.worldPose();
+    const float errorX = targetX - pose.xMm;
+    const float errorY = targetY - pose.yMm;
+    const float correctionSquared =
+        errorX * errorX + errorY * errorY;
+    const float maximumSquared =
+        RING_WORLD_CORRECTION_MAX_ERROR_MM *
+        RING_WORLD_CORRECTION_MAX_ERROR_MM;
+    if (correctionSquared > maximumSquared)
+        return false;
+
+    _debug.worldCorrectionMm = sqrtf(correctionSquared);
+    if (!_chassis.correctWorldPosition(targetX, targetY))
+        return false;
+
+    _debug.worldPoseCorrected = true;
+    return true;
 }
 
 float MaixProRingAlignment::clampMagnitude(

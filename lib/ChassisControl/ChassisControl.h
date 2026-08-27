@@ -3,6 +3,8 @@
 #include <AccelStepper.h>
 #include <Arduino.h>
 
+class ChassisEmm42TtlFeedback;
+
 class ChassisControl
 {
 public:
@@ -25,16 +27,19 @@ public:
         Idle,
         Translating,
         Rotating,
+        Stopping,
         Fault
     };
 
     /**
      * @brief 创建底盘控制器。
      *
-     * imuSerial 传入 nullptr 时仅启用基础步进电机位置控制，
-     * 不初始化任何串口，也不执行航向保持或绝对角度旋转。
+     * imuSerial 传入 nullptr 时不执行航向保持或绝对角度旋转。
+     * motorFeedback 传入 nullptr 时不初始化或占用EMM42 TTL串口。
      */
-    explicit ChassisControl(HardwareSerial *imuSerial = nullptr);
+    explicit ChassisControl(
+        HardwareSerial *imuSerial = nullptr,
+        ChassisEmm42TtlFeedback *motorFeedback = nullptr);
 
     void begin();
     void update();
@@ -54,6 +59,18 @@ public:
      * @return 成功接受命令返回 true；底盘忙碌或处于故障状态返回 false。
      */
     bool moveBodyRelative(
+        float forwardMm,
+        float rightMm,
+        float maxRpm,
+        float accelerationRpmPerS);
+
+    /**
+     * @brief 视觉追踪专用短距离平移。
+     *
+     * 运动中仍保持IMU航向，但到达本段位置后不再额外等待最终航向
+     * 静定；下一视觉帧可立即提交新修正。只供工位视觉闭环使用。
+     */
+    bool moveBodyRelativeTracking(
         float forwardMm,
         float rightMm,
         float maxRpm,
@@ -106,6 +123,13 @@ public:
         float worldXmm = 0.0F,
         float worldYmm = 0.0F,
         float worldYawDeg = 0.0F);
+    /**
+     * @brief 使用固定地标修正世界坐标位置，不改变IMU航向基准。
+     *
+     * 仅允许停车后调用；同步里程计基线可避免修正前的脉冲增量
+     * 在下一次update()时被重复累计。
+     */
+    bool correctWorldPosition(float worldXmm, float worldYmm);
     const char *faultMessage() const;
 
     static void bodyToWorld(
@@ -122,7 +146,14 @@ public:
         float &rightMm);
 
 private:
+    enum class TranslationPhase : uint8_t
+    {
+        Driving,
+        HeadingSettling
+    };
+
     HardwareSerial *_imuSerial;
+    ChassisEmm42TtlFeedback *_motorFeedback;
     AccelStepper _motors[4];
 
     State _state = State::Idle;
@@ -133,6 +164,8 @@ private:
     float _yawDeg = 0.0f;
     bool _imuReady = false;
     uint32_t _lastImuMs = 0;
+    uint32_t _imuSequence = 0;
+    uint32_t _lastEvaluatedImuSequence = 0;
 
     Pose2D _worldPose = {0.0F, 0.0F, 0.0F};
     float _worldYawOffsetDeg = 0.0F;
@@ -148,18 +181,47 @@ private:
     float _translationSpeed[4] = {};
     float _activeTranslationMaximumSpeed = 0.0f;
     bool _translationHeadingEnabled = false;
+    bool _translationFinalHeadingSettleEnabled = true;
+    TranslationPhase _translationPhase = TranslationPhase::Driving;
     float _rotateTargetDeg = 0.0f;
+    float _rotateCommandSpeed = 0.0f;
+    float _rotateFilteredYawRate = 0.0f;
+    float _rotateLastYawDeg = 0.0f;
+    uint32_t _rotateLastYawMs = 0;
+    uint32_t _rotateLastImuSequence = 0;
+    uint32_t _rotateLastControlUs = 0;
     uint8_t _stableSamples = 0;
+    uint32_t _stableSinceMs = 0;
     uint32_t _motionStartMs = 0;
+    uint32_t _motionTimeoutMs = 0;
 
     bool updateImu();
+    bool moveBodyRelativeInternal(
+        float forwardMm,
+        float rightMm,
+        float maxRpm,
+        float accelerationRpmPerS,
+        bool finalHeadingSettle);
     void updateOdometry();
     void updateTranslation();
     void updateRotation();
+    void updateStopping();
+    bool updateYawSettle(float targetYawDeg, float toleranceDeg);
+    void runYawController(float errorDeg);
+    void resetYawStability();
     void setFault(const char *message);
     void syncTargets();
     bool allMotorsStopped();
 
+    static float distanceScale(
+        float distance,
+        float positiveScale,
+        float negativeScale);
+    static uint32_t estimateTranslationTimeoutMs(
+        long maximumPulses,
+        float maximumSpeed,
+        float maximumAcceleration);
+    static uint32_t estimateRotationTimeoutMs(float absoluteErrorDeg);
     static float wrap180(float angleDeg);
     static float rpmToStepsPerSecond(float rpm);
 };

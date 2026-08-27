@@ -26,6 +26,8 @@ public:
         bool found = false;
         bool hasObservation = false;
         bool movePending = false;
+        bool worldPoseCorrected = false;
+        float worldCorrectionMm = 0.0F;
         uint8_t targetMode = maixcam::MODE_IDLE;
         uint8_t targetSelector = 0;
     };
@@ -49,14 +51,20 @@ private:
     AsyncResult _result = AsyncResult::Idle;
     bool _useGraspVision = false;
     bool _movePending = false;
+    bool _allowRingFallback = false;
+    bool _ringFallbackActive = false;
+    bool _targetSeen = false;
     uint8_t _stableFrames = 0;
     uint32_t _startedMs = 0;
     uint32_t _lastObservationMs = 0;
     uint8_t _targetMode = maixcam::MODE_IDLE;
     uint8_t _targetSelector = 0;
+    Station _station = Station::Material;
     DebugState _debug;
 
     void stopVision();
     void fail();
+    void activateStorageRingFallback();
+    bool correctWorldPositionFromLandmark();
     static float clampMagnitude(float value, float limit);
 };

@@ -26,8 +26,12 @@ MechanismTaskExecutor::MechanismTaskExecutor(
 {
 }
 
-void MechanismTaskExecutor::begin()
+void MechanismTaskExecutor::begin(uint8_t initialStorageSlot)
 {
+    _initialStorageSlot =
+        initialStorageSlot <= MATERIALS_PER_BATCH
+            ? initialStorageSlot
+            : 0;
     _graspVision.begin();
     _stepperProtocol.init(&_stepperSerial, BUS_BAUD);
     _baseProtocol.init(&_baseSerial, BUS_BAUD);
@@ -56,14 +60,19 @@ void MechanismTaskExecutor::begin()
         BASE_SUBSTEP);
 
     /*
-     * ping用于尽早发现舵机总线接错。仅在setup阶段执行一次，
-     * 比赛循环中不使用供应商库的阻塞wait()。
+     * 使用FSUS底层的完整初始化，同步当前角度并明确设置单圈模式。
+     * 不使用FSGP_Gripper：其负载检测未实现，open/wait又会阻塞主循环。
      */
-    if (!_storageServo.ping() || !_gripperServo.ping())
+    _storageServo.init(STORAGE_SERVO_ID, &_servoProtocol);
+    _gripperServo.init(GRIPPER_SERVO_ID, &_servoProtocol);
+    if (!_storageServo.isOnline || !_gripperServo.isOnline)
     {
         fail("mechanism servo offline");
         return;
     }
+    _gripperServo.setAngleRange(
+        min(GRIPPER_OPEN_ANGLE, GRIPPER_OPEN_MAX_ANGLE),
+        max(GRIPPER_CLOSE_ANGLE, GRIPPER_OPEN_MAX_ANGLE));
     // 与new_project一致：载物盘使用标准角度指令和库内速度换算。
     _storageServo.setSpeed(STORAGE_SPEED_DPS);
 
@@ -71,6 +80,14 @@ void MechanismTaskExecutor::begin()
     _result = AsyncResult::Running;
     _phase = TaskPhase::Initializing;
     _itemIndex = 0;
+    _collectedItemMask[0] = 0;
+    _collectedItemMask[1] = 0;
+    _missedItemMask[0] = 0;
+    _missedItemMask[1] = 0;
+    _primedItemIndex = -1;
+    _preparedStorageSlot = -1;
+    _pickupReferenceValid = false;
+    _pickupTargetSeen = false;
     _fault = "";
     loadInitializationAction();
 }
@@ -97,8 +114,14 @@ const char *MechanismTaskExecutor::debugPhase() const
         return "COLLECT_PREP";
     case TaskPhase::CollectAligning:
         return "COLLECT_ALIGN";
+    case TaskPhase::CollectApproaching:
+        return "COLLECT_DOWN";
+    case TaskPhase::CollectGrasping:
+        return "COLLECT_GRAB";
     case TaskPhase::CollectDepositing:
         return "COLLECT_DEPOSIT";
+    case TaskPhase::CollectSkipping:
+        return "COLLECT_SKIP";
     case TaskPhase::CollectReturningToRoute:
         return "COLLECT_RETURN";
     case TaskPhase::RoughPlacing:
@@ -107,6 +130,10 @@ const char *MechanismTaskExecutor::debugPhase() const
         return "ROUGH_GET";
     case TaskPhase::FinalStoring:
         return "FINAL_STORE";
+    case TaskPhase::CalibratingRoughPlacement:
+        return "ROUGH_PLACE_CAL";
+    case TaskPhase::CalibratingRoughReturn:
+        return "ROUGH_RETURN_CAL";
     case TaskPhase::Idle:
         return "IDLE";
     }
@@ -117,6 +144,12 @@ const MechanismTaskExecutor::GraspDebugState &
 MechanismTaskExecutor::graspDebug() const
 {
     return _graspDebug;
+}
+
+const MechanismTaskExecutor::MotionDebugState &
+MechanismTaskExecutor::motionDebug() const
+{
+    return _motionDebug;
 }
 
 bool MechanismTaskExecutor::prepareForTravel(
@@ -150,12 +183,28 @@ bool MechanismTaskExecutor::prepareForTravel(
      * 粗加工区和暂存区的第一个动作都从本批第一物料开始。行驶途中
      * 预先将第一物料槽转到机械臂取放位，避免到站后再等待载物盘。
      */
-    const uint8_t traySlot =
-        destination == TravelDestination::RoughProcessing ||
-                destination == TravelDestination::Storage
-            ? 1
-            : 0;
-    loadTravelAction(liftTarget, traySlot);
+    uint8_t traySlot = 0;
+    if (destination == TravelDestination::Material)
+    {
+        traySlot = 1;
+    }
+    else if (destination == TravelDestination::RoughProcessing ||
+             destination == TravelDestination::Storage)
+    {
+        // 若有原料抓取失败，直接预转第一个实际有料的槽位。
+        for (uint8_t index = 0; index < MATERIALS_PER_BATCH; ++index)
+        {
+            if ((_collectedItemMask[_round] & (1U << index)) != 0)
+            {
+                traySlot = index + 1;
+                break;
+            }
+        }
+    }
+    loadTravelAction(
+        liftTarget,
+        traySlot,
+        destination != TravelDestination::Home);
     return true;
 }
 
@@ -178,8 +227,12 @@ bool MechanismTaskExecutor::start(
 
     _round = round;
     _batch = batch;
+    _batchByRound[_round] = batch;
     _itemIndex = 0;
     _alignmentForwardOffset = 0.0F;
+    _alignmentRightOffset = 0.0F;
+    _pickupReferenceValid = false;
+    _pickupTargetSeen = false;
     _forwardCommandActive = false;
     _result = AsyncResult::Running;
     _fault = "";
@@ -187,28 +240,162 @@ bool MechanismTaskExecutor::start(
     switch (task)
     {
     case StationTask::CollectMaterial:
+        _collectedItemMask[_round] = 0;
+        _missedItemMask[_round] = 0;
+        primePickupVision(0);
         _phase = TaskPhase::CollectPreparing;
         loadTurntablePreparationAction(1);
         break;
 
     case StationTask::RoughProcessing:
+        if (!selectFirstAvailableItem())
+        {
+            finishStationTask();
+            break;
+        }
         _phase = TaskPhase::RoughPlacing;
         loadStorageToRingAction(
-            1,
-            ROUGH_RING_POSES[_batch.roughPositions[0]],
-            0);
+            _itemIndex + 1,
+            ROUGH_RING_POSES[
+                _batch.roughPositions[_itemIndex]],
+            0,
+            hasAvailableItemAfterCurrent());
         break;
 
     case StationTask::StoreFinishedProduct:
+        if (!selectFirstAvailableItem())
+        {
+            finishStationTask();
+            break;
+        }
         _phase = TaskPhase::FinalStoring;
         loadStorageToRingAction(
-            1,
+            _itemIndex + 1,
             FINAL_STORAGE_RING_POSES[
-                _batch.storagePositions[0]],
-            _round);
+                _batch.storagePositions[_itemIndex]],
+            currentStorageStackLevel(),
+            hasAvailableItemAfterCurrent());
         break;
     }
 
+    return true;
+}
+
+bool MechanismTaskExecutor::startRoughPlacementCalibration(
+    uint8_t ring,
+    uint16_t speed,
+    uint8_t acceleration)
+{
+    if (!ready() ||
+        _result == AsyncResult::Running ||
+        !validRing(ring) ||
+        speed == 0 ||
+        acceleration == 0)
+    {
+        return false;
+    }
+
+    clearAction();
+    _roughPlacementCalibrationActive = true;
+    _roughPlacementCalibrationSpeed = speed;
+    _roughPlacementCalibrationAcceleration = acceleration;
+    _motionDebug.roughPlacementIssuedMs = 0;
+    _motionDebug.roughPlacementConfirmedMs = 0;
+    _result = AsyncResult::Running;
+    _fault = "";
+    _phase = TaskPhase::CalibratingRoughPlacement;
+
+    const RingPose &pose = ROUGH_RING_POSES[ring];
+
+    // 固定从储料盘3号槽取料，测试期间不再旋转载物盘。
+    addStep(StepKind::Lift, LIFT_HOME);
+    addStep(StepKind::RotateBase, BASE_TRAY_TRANSFER);
+    addConcurrentStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
+    addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
+    addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
+    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+
+    // 与正式出盘一致：先到Home，再三轴并行到圆环完整点位。
+    addStep(StepKind::Lift, LIFT_HOME);
+    addStep(StepKind::Lift, pose.lift);
+    const uint8_t placementGroup = _steps[_stepCount - 1].group;
+    appendStep(
+        StepKind::RotateBaseRoughCalibration,
+        pose.base,
+        placementGroup);
+    appendStep(
+        StepKind::Extend,
+        pose.extension,
+        placementGroup);
+
+    // 到圆环后放料并上抬100，便于观察落点和下一轮安全回盘。
+    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
+    addStep(
+        StepKind::Lift,
+        max(LIFT_HOME, pose.lift - RING_PLACEMENT_RELEASE_LIFT));
+    return true;
+}
+
+bool MechanismTaskExecutor::startRoughReturnCalibration(
+    uint8_t ring,
+    uint16_t speed,
+    uint8_t acceleration)
+{
+    if (!ready() ||
+        _result == AsyncResult::Running ||
+        !validRing(ring) ||
+        speed == 0 ||
+        acceleration == 0)
+    {
+        return false;
+    }
+
+    clearAction();
+    _roughReturnCalibrationActive = true;
+    _roughReturnCalibrationSpeed = speed;
+    _roughReturnCalibrationAcceleration = acceleration;
+    _motionDebug.roughReturnIssuedMs = 0;
+    _motionDebug.roughReturnConfirmedMs = 0;
+    _result = AsyncResult::Running;
+    _fault = "";
+    _phase = TaskPhase::CalibratingRoughReturn;
+
+    const RingPose &pose = ROUGH_RING_POSES[ring];
+
+    /*
+     * 物料由测试人员预先放在所选圆环。空爪先按正常参数
+     * 从固定的3号料盘位到圆环，这一段不计入回程标定。
+     */
+    addStep(StepKind::Lift, LIFT_HOME);
+    addStep(StepKind::Lift, pose.lift);
+    const uint8_t arrivalGroup = _steps[_stepCount - 1].group;
+    appendStep(StepKind::RotateBase, pose.base, arrivalGroup);
+    appendStep(StepKind::Extend, pose.extension, arrivalGroup);
+    appendStep(
+        StepKind::OpenGripper,
+        GRIPPER_OPEN_ANGLE,
+        arrivalGroup);
+    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+
+    // 先竖直上抬100，再用候选参数三轴并行直接回2770。
+    addStep(
+        StepKind::Lift,
+        max(LIFT_HOME, pose.lift - RING_PICKUP_RELEASE_LIFT));
+    addStep(StepKind::Lift, LIFT_HOME);
+    const uint8_t returnGroup = _steps[_stepCount - 1].group;
+    appendStep(
+        StepKind::RotateBaseRoughReturnCalibration,
+        BASE_TRAY_TRANSFER,
+        returnGroup);
+    appendStep(
+        StepKind::Extend,
+        EXTENSION_HOME,
+        returnGroup);
+
+    // 回程到位后放入固定的3号料盘位。
+    addStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
+    addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
+    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
     return true;
 }
 
@@ -224,10 +411,40 @@ void MechanismTaskExecutor::update()
         return;
     }
 
+    if (_phase == TaskPhase::CollectApproaching)
+    {
+        _graspVision.update();
+        updatePickupApproach();
+        return;
+    }
+
+    if (_phase == TaskPhase::CollectGrasping)
+    {
+        /*
+         * 闭爪期间继续清空当前物料的相机帧。闭爪稳定后直接升到
+         * 安全高度，不再停在中间高度做二次视觉确认。
+         */
+        _graspVision.update();
+        GraspObservation stale;
+        _graspVision.takeObservation(stale);
+        if (updateCurrentStep())
+            onActionCompleted();
+        return;
+    }
+
     if (_phase == TaskPhase::CollectReturningToRoute)
     {
         updateReturnToMaterialRouteAnchor();
         return;
+    }
+
+    if ((_phase == TaskPhase::CollectPreparing ||
+         _phase == TaskPhase::CollectDepositing ||
+         _phase == TaskPhase::CollectSkipping) &&
+        _primedItemIndex >= 0)
+    {
+        // 机械动作执行期间并行寻找本件或下一件物料。
+        _graspVision.update();
     }
 
     if (updateCurrentStep())
@@ -242,6 +459,7 @@ AsyncResult MechanismTaskExecutor::result() const
 void MechanismTaskExecutor::cancel()
 {
     _graspVision.stop();
+    _primedItemIndex = -1;
     if (_forwardCommandActive)
         _forwardPositioner.stop();
 
@@ -265,6 +483,7 @@ void MechanismTaskExecutor::clearAction()
     _nextStepGroup = 0;
     _sharedPollOwner = nullptr;
     _lastSharedBusPollMs = 0;
+    _storageToRoughFastProfile = false;
 }
 
 void MechanismTaskExecutor::addStep(
@@ -323,6 +542,8 @@ void MechanismTaskExecutor::appendStep(
         false,
         0,
         0,
+        0,
+        0,
         0};
 }
 
@@ -354,41 +575,155 @@ void MechanismTaskExecutor::addSafeRetraction(float baseTarget)
     addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
 }
 
-void MechanismTaskExecutor::addStorageDeposit()
+void MechanismTaskExecutor::addParallelTransfer(
+    float baseTarget,
+    float extensionTarget)
+{
+    /*
+     * 调用方已经先竖直上抬并脱离物料。随后升降回安全高度、底座
+     * 转向目标、伸缩到目标点同时执行。这里有意绕过通用升降独占保护。
+     */
+    addStep(StepKind::Lift, LIFT_HOME);
+    const uint8_t departureGroup = _steps[_stepCount - 1].group;
+    appendStep(
+        StepKind::RotateBase,
+        baseTarget,
+        departureGroup);
+    appendStep(
+        StepKind::Extend,
+        extensionTarget,
+        departureGroup);
+}
+
+void MechanismTaskExecutor::addLiftThenRingTransfer(
+    float clearanceLiftTarget,
+    float baseTarget,
+    float liftTarget,
+    float extensionTarget,
+    int8_t storageSlotToPrepare)
+{
+    /*
+     * 动作一：只有升降轴抬到指定安全高度。Home点使用
+     * 专用的连续两帧到位反馈完成确认。
+    */
+    addStep(StepKind::Lift, clearanceLiftTarget);
+
+    /*
+     * 动作二：安全高度确认后，升降、底座和伸缩三轴同组运行，
+     * 一次到达圆环完整点位。
+     */
+    addStep(StepKind::Lift, liftTarget);
+    const uint8_t ringTransferGroup = _steps[_stepCount - 1].group;
+    appendStep(
+        StepKind::RotateBase,
+        baseTarget,
+        ringTransferGroup);
+    appendStep(
+        StepKind::Extend,
+        extensionTarget,
+        ringTransferGroup);
+    if (storageSlotToPrepare >= 0)
+    {
+        appendStoragePreparation(
+            static_cast<uint8_t>(storageSlotToPrepare),
+            ringTransferGroup);
+    }
+}
+
+void MechanismTaskExecutor::addRoughRingToTrayRetraction(uint8_t ring)
+{
+    if (!validRing(ring))
+    {
+        fail("invalid rough ring retraction");
+        return;
+    }
+
+    /*
+     * 调用方已经先上抬100并脱离物料。随后升降回120、伸缩回收、
+     * 底座按当前圆环慢速档直接到2770，三轴同组并行且不再经2400。
+     */
+    addStep(StepKind::Lift, LIFT_HOME);
+    const uint8_t safeGroup = _steps[_stepCount - 1].group;
+    appendStep(
+        StepKind::RotateBaseRoughReturn,
+        BASE_TRAY_TRANSFER,
+        safeGroup);
+    appendStep(
+        StepKind::Extend,
+        EXTENSION_HOME,
+        safeGroup);
+}
+
+void MechanismTaskExecutor::addStorageDeposit(bool liftAfterDeposit)
 {
     // 底座已经进入车内方向后，按固定安全顺序将物料放回载物盘。
     addStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
     addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
     addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
-    addStep(StepKind::Lift, LIFT_HOME);
+    if (liftAfterDeposit)
+        addStep(StepKind::Lift, LIFT_HOME);
+}
+
+void MechanismTaskExecutor::appendStoragePreparation(
+    uint8_t traySlot,
+    uint8_t group)
+{
+    if (traySlot > MATERIALS_PER_BATCH || storageSlotPrepared(traySlot))
+        return;
+
+    appendStep(
+        StepKind::RotateStorage,
+        TRAY_SLOT_ANGLE[traySlot],
+        group);
+}
+
+bool MechanismTaskExecutor::storageSlotPrepared(uint8_t traySlot) const
+{
+    return traySlot <= MATERIALS_PER_BATCH &&
+           _preparedStorageSlot == static_cast<int8_t>(traySlot);
+}
+
+int8_t MechanismTaskExecutor::nextAvailableTraySlot() const
+{
+    for (uint8_t index = _itemIndex + 1;
+         index < MATERIALS_PER_BATCH;
+         ++index)
+    {
+        if ((_collectedItemMask[_round] & (1U << index)) != 0)
+            return static_cast<int8_t>(index + 1);
+    }
+    return -1;
 }
 
 void MechanismTaskExecutor::loadTravelAction(
     float liftTarget,
-    uint8_t traySlot)
+    uint8_t traySlot,
+    bool useAlignmentOpenMax)
 {
     clearAction();
 
-    const bool liftingToSafeHeight =
-        liftTarget <= LIFT_HOME;
-
     /*
-     * 升轴先于所有横向动作，先建立安全间隙；降轴则必须等底座、
-     * 伸缩、载物盘和夹爪全部到位后再执行。粗加工视觉高度900
-     * 属于降轴动作，因此会排在本动作表最后。
+     * 工位最后一件放下后底盘已经开始行驶，因此运输动作
+     * 始终先单轴抬到Home，再收底座、伸缩和载物盘。需要
+     * 工位视觉高度时，收纳完成后再降到该高度。
      */
-    if (liftingToSafeHeight)
-        addStep(StepKind::Lift, liftTarget);
+    addStep(StepKind::Lift, LIFT_HOME);
 
     addStep(StepKind::RotateBase, BASE_HOME);
     addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+    appendStoragePreparation(
+        traySlot,
+        _steps[_stepCount - 1].group);
+    // 赴工位对齐时使用最大开度；回终点只用普通开度。
     addConcurrentStep(
-        StepKind::RotateStorage,
-        TRAY_SLOT_ANGLE[traySlot]);
-    // 运输收纳时保持夹爪张开，避免到粗加工区后遮挡圆环视野。
-    addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
+        useAlignmentOpenMax
+            ? StepKind::OpenGripperMax
+            : StepKind::OpenGripper,
+        useAlignmentOpenMax
+            ? GRIPPER_OPEN_MAX_ANGLE
+            : GRIPPER_OPEN_ANGLE);
 
-    if (!liftingToSafeHeight)
+    if (liftTarget > LIFT_HOME)
         addStep(StepKind::Lift, liftTarget);
 }
 
@@ -398,40 +733,119 @@ void MechanismTaskExecutor::loadInitializationAction()
     addStep(StepKind::Lift, LIFT_INITIAL);
     addStep(StepKind::RotateBase, BASE_INITIAL);
     addConcurrentStep(StepKind::Extend, EXTENSION_INITIAL);
-    addConcurrentStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[0]);
+    addConcurrentStep(
+        StepKind::RotateStorage,
+        TRAY_SLOT_ANGLE[_initialStorageSlot]);
     // 初始化时夹爪内没有物料，只按角度确认空载闭合。
     addConcurrentStep(
         StepKind::CloseGripperUnloaded,
         GRIPPER_CLOSE_ANGLE);
 }
 
-void MechanismTaskExecutor::loadTurntablePreparationAction(uint8_t traySlot)
+void MechanismTaskExecutor::loadTurntablePreparationAction(
+    uint8_t traySlot,
+    bool liftAlreadyHome)
 {
     clearAction();
 
     /*
-     * 升降轴必须先独立到达安全高度。随后底座、载物盘和夹爪
-     * 可以并行准备，全部到位后才允许伸出长臂。
+     * 首件从视觉/行驶姿态进入时必须先确认Home。连续抓取时，上一件
+     * 的存盘或失败恢复已经等待Home到位，不再重复发命令和查询状态。
      */
-    addStep(StepKind::Lift, LIFT_HOME);
+    if (!liftAlreadyHome)
+        addStep(StepKind::Lift, LIFT_HOME);
     addStep(StepKind::RotateBase, BASE_TURNTABLE);
+    appendStoragePreparation(
+        traySlot,
+        _steps[_stepCount - 1].group);
     addConcurrentStep(
-        StepKind::RotateStorage,
-        TRAY_SLOT_ANGLE[traySlot]);
-    addConcurrentStep(StepKind::OpenGripperMax, GRIPPER_OPEN_MAX_ANGLE);
+        StepKind::OpenGripperMax,
+        GRIPPER_OPEN_MAX_ANGLE);
 
-    // 底座进入转盘方向后再伸出，避免长臂扫过车体结构。
+    // 先到原料抓取初始位，微调时dy优先由伸缩轴补偿。
     addStep(StepKind::Extend, EXTENSION_TURNTABLE);
+
+    /*
+     * 该动作完成后才启动原料视觉，因此搜索和追踪全程保持在150；
+     * 对准完成后由Approach动作下降到LIFT_TURNTABLE夹取高度。
+     */
+    addStep(StepKind::Lift, LIFT_MATERIAL_VISION);
 }
 
-void MechanismTaskExecutor::loadTurntablePickupToStorageAction()
+void MechanismTaskExecutor::loadTurntableApproachAction()
 {
     clearAction();
     addStep(StepKind::Lift, LIFT_TURNTABLE);
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+}
 
-    addSafeRetraction(BASE_TRAY_TRANSFER);
-    addStorageDeposit();
+void MechanismTaskExecutor::loadTurntableGraspAction()
+{
+    clearAction();
+    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+}
+
+void MechanismTaskExecutor::loadPickupToStorageAction(
+    uint8_t traySlot,
+    bool liftAfterDeposit)
+{
+    clearAction();
+
+    /*
+     * 闭爪后先升到安全高度。随后在底座回车内、伸缩轴回收的同时，
+     * 再次明确将当前储料槽转到交接位，避免只依赖抓取准备阶段的
+     * 预旋转状态。三个动作全部完成后才允许机械臂下降存料。
+     */
+    addStep(StepKind::Lift, LIFT_HOME);
+    addStep(StepKind::RotateBase, BASE_TRAY_TRANSFER);
+    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+    appendStoragePreparation(
+        traySlot,
+        _steps[_stepCount - 1].group);
+
+    addStorageDeposit(liftAfterDeposit);
+}
+
+void MechanismTaskExecutor::loadSkippedPickupRecoveryAction()
+{
+    clearAction();
+
+    /*
+     * 先小幅松爪并同时竖直抬升，避免一次张开到最大时
+     * 将边缘物料推飞或拖走。该并行组仍必须等Home到位。
+     */
+    addStep(StepKind::Lift, LIFT_HOME);
+    const uint8_t releaseAndLiftGroup = _steps[_stepCount - 1].group;
+    appendStep(
+        StepKind::OpenGripper,
+        GRIPPER_OPEN_ANGLE,
+        releaseAndLiftGroup);
+
+    // 离开物料平面后再张到最大角度，为下一件对齐做准备。
+    addStep(
+        StepKind::OpenGripperMax,
+        GRIPPER_OPEN_MAX_ANGLE);
+
+    // 最后底座转回车内，伸缩轴同时收回。
+    addStep(StepKind::RotateBase, BASE_TRAY_TRANSFER);
+    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+}
+
+bool MechanismTaskExecutor::primePickupVision(uint8_t itemIndex)
+{
+    if (itemIndex >= MATERIALS_PER_BATCH)
+        return false;
+
+    if (_primedItemIndex == static_cast<int8_t>(itemIndex))
+        return true;
+
+    if (!_graspVision.startTracking(_batch.colors[itemIndex]))
+    {
+        _primedItemIndex = -1;
+        return false;
+    }
+
+    _primedItemIndex = static_cast<int8_t>(itemIndex);
+    return true;
 }
 
 void MechanismTaskExecutor::startPickupAlignment()
@@ -440,17 +854,36 @@ void MechanismTaskExecutor::startPickupAlignment()
     _stableFrames = 0;
     _alignmentStartedMs = millis();
     _lastObservationMs = 0;
-    _alignmentObservationAfterMs = _alignmentStartedMs;
+    _pickupSearchWaypointMs = _alignmentStartedMs;
+    _pickupSearchIndex = 0;
+    _pickupSearchPass = 0;
+    // 后续物料从第一次抓取基准开始；首个无目标帧先触发回基准。
+    _pickupTargetSeen = _pickupReferenceValid;
+    _alignmentObservationAfterMs =
+        _alignmentStartedMs > vision_config::
+                                  PRIMED_OBSERVATION_MAX_AGE_MS
+            ? _alignmentStartedMs -
+                  vision_config::
+                      PRIMED_OBSERVATION_MAX_AGE_MS
+            : 0;
     _alignmentExtensionTarget = EXTENSION_TURNTABLE;
     _graspDebug = {};
     _graspDebug.item = _itemIndex + 1;
+    _graspDebug.attempt = 1;
+    _graspDebug.collectedMask = _collectedItemMask[_round];
+    _graspDebug.missedMask = _missedItemMask[_round];
     _graspDebug.forwardOffsetMm = _alignmentForwardOffset;
+    _graspDebug.rightOffsetMm = _alignmentRightOffset;
     _graspDebug.extensionTarget = _alignmentExtensionTarget;
     _graspDebug.tracking = true;
 
-    if (!_graspVision.startTracking(_batch.colors[_itemIndex]))
+    /*
+     * 相机在机构准备和上一件存放期间已经开始找料。这里只在预启动
+     * 失败或目标发生变化时重新下发命令，避免每件多等一个相机周期。
+     */
+    if (!primePickupVision(_itemIndex))
     {
-        fail("failed to start grasp vision");
+        skipCurrentPickup();
         return;
     }
 
@@ -462,29 +895,16 @@ void MechanismTaskExecutor::updatePickupAlignment()
     using namespace vision_config;
 
     const uint32_t now = millis();
-    if (_graspVision.faulted())
-    {
-        fail("MaixPro rejected grasp target");
-        return;
-    }
-
     if (_forwardPositioner.faulted())
     {
         fail("material forward positioning failed");
         return;
     }
 
-    if (now - _alignmentStartedMs >= TARGET_SEARCH_TIMEOUT_MS)
-    {
-        _graspDebug.tracking = false;
-        fail("grasp target search timeout");
-        return;
-    }
-
     /*
-     * 每次根据图像计算出底盘前后和伸缩目标后，先等待二者实际
-     * 到位，再使用到位后的新图像继续精调。底盘接口不提供左右
-     * 横移能力，朝转盘方向的误差只能由伸缩轴消除。
+     * dy优先由伸缩轴补偿。只有伸缩轴已完成到1500的动作，
+     * 且新帧仍要求继续收缩时，才向底盘下发左移；视觉闭环
+     * 不会下发右移。
      */
     if (_stepCount > 0 || _forwardCommandActive)
     {
@@ -498,8 +918,32 @@ void MechanismTaskExecutor::updatePickupAlignment()
 
         clearAction();
         _forwardCommandActive = false;
-        _alignmentObservationAfterMs = millis();
+        const uint32_t completedMs = millis();
+        _pickupSearchWaypointMs = completedMs;
+        _alignmentObservationAfterMs =
+            completedMs >
+                    MOVING_OBSERVATION_GRACE_MS
+                ? completedMs -
+                      MOVING_OBSERVATION_GRACE_MS
+                : 0;
         _lastObservationMs = 0;
+        return;
+    }
+
+    /*
+     * 视觉拒绝或搜索超时属于“本件未抓到”，不是整机故障。必须等
+     * 已下发的底盘/伸缩修正结束后再执行跳过收臂，避免边走边收臂。
+     */
+    if (_graspVision.faulted())
+    {
+        skipCurrentPickup();
+        return;
+    }
+
+    if (now - _alignmentStartedMs >= TARGET_SEARCH_TIMEOUT_MS)
+    {
+        _graspDebug.tracking = false;
+        skipCurrentPickup();
         return;
     }
 
@@ -511,10 +955,17 @@ void MechanismTaskExecutor::updatePickupAlignment()
         {
             _stableFrames = 0;
         }
+        if (now - _pickupSearchWaypointMs >=
+            PICKUP_SEARCH_WAYPOINT_WAIT_MS)
+        {
+            if (_pickupTargetSeen && restorePickupReference())
+                return;
+            advancePickupSearch();
+        }
         return;
     }
 
-    // 丢弃电机运动期间产生的旧图像，只使用到位后的观测。
+    // 只拒绝早于运动末段复用窗口的旧图像。
     if (static_cast<int32_t>(
             observation.receivedMs -
             _alignmentObservationAfterMs) < 0)
@@ -523,16 +974,27 @@ void MechanismTaskExecutor::updatePickupAlignment()
     }
 
     _lastObservationMs = observation.receivedMs;
+    // 任意新帧都重新开始驻点计时，避免两帧稳定确认之间误触发搜索。
+    _pickupSearchWaypointMs = now;
     _graspDebug.dx = observation.dx;
     _graspDebug.dy = observation.dy;
     _graspDebug.quality = observation.quality;
     _graspDebug.found = observation.found;
     _graspDebug.hasObservation = true;
-    if (!observation.found || observation.quality < MIN_QUALITY)
+    if (!observation.found)
+    {
+        _stableFrames = 0;
+        if (_pickupTargetSeen && restorePickupReference())
+            return;
+        advancePickupSearch();
+        return;
+    }
+    if (observation.quality < MIN_QUALITY)
     {
         _stableFrames = 0;
         return;
     }
+    _pickupTargetSeen = true;
 
     const int16_t errorDx = observation.dx - TARGET_DX_PX;
     const int16_t errorDy = observation.dy - TARGET_DY_PX;
@@ -547,10 +1009,12 @@ void MechanismTaskExecutor::updatePickupAlignment()
 
         if (_stableFrames >= REQUIRED_STABLE_FRAMES)
         {
-            _graspDebug.tracking = false;
-            _graspVision.stop();
-            _phase = TaskPhase::CollectDepositing;
-            loadTurntablePickupToStorageAction();
+            /*
+             * 目标在下降前进入稳定抓取窗口后立即下降。下降开始后
+             * 不再根据视觉结果进行确认或撤销，到位直接闭爪。
+             */
+            _phase = TaskPhase::CollectApproaching;
+            loadTurntableApproachAction();
         }
         return;
     }
@@ -575,6 +1039,10 @@ void MechanismTaskExecutor::updatePickupAlignment()
         fineAlignment
             ? FINE_EXTENSION_MAX_DELTA
             : COARSE_EXTENSION_MAX_DELTA;
+    const float leftLimit =
+        fineAlignment
+            ? FINE_LEFT_MAX_DELTA_MM
+            : COARSE_LEFT_MAX_DELTA_MM;
 
     forwardDelta = clampValue(
         forwardDelta,
@@ -594,23 +1062,56 @@ void MechanismTaskExecutor::updatePickupAlignment()
         PICKUP_EXTENSION_MIN,
         PICKUP_EXTENSION_MAX);
 
+    /*
+     * 不在“本次刚好到1500”的同一轮就横移。必须先等
+     * 伸缩动作到位，再用下一帧确认仍需继续收缩。
+     */
+    float leftDelta = 0.0F;
+    if (_alignmentExtensionTarget >=
+            PICKUP_EXTENSION_MAX - 0.1F &&
+        extensionDelta > 0.0F)
+    {
+        leftDelta = clampValue(
+            LEFT_FROM_DY * errorDy,
+            -leftLimit,
+            0.0F);
+    }
+    const float nextRightOffset = clampValue(
+        _alignmentRightOffset + leftDelta,
+        PICKUP_RIGHT_MIN_OFFSET_MM,
+        PICKUP_RIGHT_MAX_OFFSET_MM);
+
     const float forwardMove =
         nextForwardOffset - _alignmentForwardOffset;
-    if (fabsf(forwardMove) > 0.1F)
+    const float rightMove =
+        nextRightOffset - _alignmentRightOffset;
+    if (fabsf(forwardMove) > FORWARD_COMMAND_DEADBAND_MM ||
+        fabsf(rightMove) > RIGHT_COMMAND_DEADBAND_MM)
     {
-        if (!_forwardPositioner.moveForward(forwardMove))
+        if (!_forwardPositioner.moveBodyRelative(
+                forwardMove,
+                rightMove))
         {
-            fail("material forward correction rejected");
+            fail("material chassis correction rejected");
             return;
         }
         _alignmentForwardOffset = nextForwardOffset;
+        _alignmentRightOffset = nextRightOffset;
         _graspDebug.forwardOffsetMm = _alignmentForwardOffset;
+        _graspDebug.rightOffsetMm = _alignmentRightOffset;
         _forwardCommandActive = true;
     }
 
-    if (fabsf(
+    const bool mustReachRetractionLimit =
+        nextExtensionTarget >=
+            PICKUP_EXTENSION_MAX - 0.1F &&
+        _alignmentExtensionTarget <
+            PICKUP_EXTENSION_MAX - 0.1F;
+    if (mustReachRetractionLimit ||
+        fabsf(
             nextExtensionTarget -
-            _alignmentExtensionTarget) > 0.1F)
+            _alignmentExtensionTarget) >
+            EXTENSION_COMMAND_DEADBAND)
     {
         _alignmentExtensionTarget = nextExtensionTarget;
         _graspDebug.extensionTarget = _alignmentExtensionTarget;
@@ -622,7 +1123,7 @@ void MechanismTaskExecutor::updatePickupAlignment()
     if (!_forwardCommandActive && _stepCount == 0)
     {
         /*
-         * 原料转盘仍在旋转。目标颜色位于视野边缘时，底盘和伸缩轴
+         * 原料转盘仍在旋转。目标颜色位于视野边缘时，底盘
          * 可能已经到达本工位软限位，此时不能继续追赶，也不应立即
          * 终止整场任务。保持当前位置读取后续新帧，等待目标随转盘
          * 进入可抓取范围；TARGET_SEARCH_TIMEOUT_MS仍负责最终兜底。
@@ -632,20 +1133,266 @@ void MechanismTaskExecutor::updatePickupAlignment()
     }
 }
 
+bool MechanismTaskExecutor::restorePickupReference()
+{
+    using namespace vision_config;
+
+    _pickupTargetSeen = false;
+    if (!_pickupReferenceValid)
+        return false;
+
+    bool commanded = false;
+    const float forwardMove =
+        _pickupReferenceForwardOffset -
+        _alignmentForwardOffset;
+    const float rightMove =
+        _pickupReferenceRightOffset -
+        _alignmentRightOffset;
+    if (fabsf(forwardMove) > FORWARD_COMMAND_DEADBAND_MM ||
+        fabsf(rightMove) > RIGHT_COMMAND_DEADBAND_MM)
+    {
+        if (!_forwardPositioner.moveBodyRelative(
+                forwardMove,
+                rightMove))
+        {
+            fail("material reference return rejected");
+            return true;
+        }
+        _alignmentForwardOffset =
+            _pickupReferenceForwardOffset;
+        _alignmentRightOffset =
+            _pickupReferenceRightOffset;
+        _graspDebug.forwardOffsetMm =
+            _alignmentForwardOffset;
+        _graspDebug.rightOffsetMm =
+            _alignmentRightOffset;
+        _forwardCommandActive = true;
+        commanded = true;
+    }
+
+    if (fabsf(
+            _pickupReferenceExtensionTarget -
+            _alignmentExtensionTarget) >
+        EXTENSION_COMMAND_DEADBAND)
+    {
+        _alignmentExtensionTarget =
+            _pickupReferenceExtensionTarget;
+        _graspDebug.extensionTarget =
+            _alignmentExtensionTarget;
+        addStep(
+            StepKind::Extend,
+            _alignmentExtensionTarget);
+        commanded = true;
+    }
+
+    _pickupSearchWaypointMs = millis();
+    return commanded;
+}
+
+void MechanismTaskExecutor::advancePickupSearch()
+{
+    using namespace vision_config;
+
+    if (++_pickupSearchIndex >= PICKUP_SEARCH_POSITION_COUNT)
+    {
+        _pickupSearchIndex = 0;
+        if (++_pickupSearchPass >= PICKUP_SEARCH_MAX_PASSES)
+        {
+            _graspDebug.tracking = false;
+            skipCurrentPickup();
+            return;
+        }
+    }
+
+    const float searchCenter =
+        _pickupReferenceValid
+            ? _pickupReferenceForwardOffset
+            : 0.0F;
+    const float targetOffset = clampValue(
+        searchCenter +
+            PICKUP_SEARCH_OFFSETS_MM[_pickupSearchIndex],
+        PICKUP_FORWARD_MIN_OFFSET_MM,
+        PICKUP_FORWARD_MAX_OFFSET_MM);
+    const float move = targetOffset - _alignmentForwardOffset;
+    _pickupSearchWaypointMs = millis();
+    _stableFrames = 0;
+
+    if (fabsf(move) <= FORWARD_COMMAND_DEADBAND_MM)
+        return;
+
+    if (!_forwardPositioner.moveBodyRelative(move, 0.0F))
+    {
+        fail("material search move rejected");
+        return;
+    }
+
+    _alignmentForwardOffset = targetOffset;
+    _graspDebug.forwardOffsetMm = _alignmentForwardOffset;
+    _forwardCommandActive = true;
+}
+
+void MechanismTaskExecutor::updatePickupApproach()
+{
+    if (updateCurrentStep())
+        startGripperClosing();
+}
+
+void MechanismTaskExecutor::startGripperClosing()
+{
+    _phase = TaskPhase::CollectGrasping;
+    loadTurntableGraspAction();
+}
+
+void MechanismTaskExecutor::acceptPickup()
+{
+    if (!_pickupReferenceValid)
+    {
+        _pickupReferenceForwardOffset =
+            _alignmentForwardOffset;
+        _pickupReferenceRightOffset =
+            _alignmentRightOffset;
+        _pickupReferenceExtensionTarget =
+            _alignmentExtensionTarget;
+        _pickupReferenceValid = true;
+    }
+
+    _graspVision.stop();
+    _primedItemIndex = -1;
+    _collectedItemMask[_round] |=
+        static_cast<uint8_t>(1U << _itemIndex);
+    _graspDebug.collectedMask = _collectedItemMask[_round];
+    _graspDebug.tracking = false;
+    _phase = TaskPhase::CollectDepositing;
+    loadPickupToStorageAction(
+        _itemIndex + 1,
+        _itemIndex + 1 < MATERIALS_PER_BATCH);
+
+    /*
+     * 存放当前物料通常耗时数秒，利用这段机械动作时间提前搜索
+     * 下一种颜色，到下一轮对准时直接使用最近的有效观测。
+     */
+    if (_itemIndex + 1 < MATERIALS_PER_BATCH)
+        primePickupVision(_itemIndex + 1);
+}
+
+void MechanismTaskExecutor::skipCurrentPickup()
+{
+    _graspVision.stop();
+    _primedItemIndex = -1;
+    _missedItemMask[_round] |=
+        static_cast<uint8_t>(1U << _itemIndex);
+    _graspDebug.item = _itemIndex + 1;
+    _graspDebug.attempt = 1;
+    _graspDebug.collectedMask = _collectedItemMask[_round];
+    _graspDebug.missedMask = _missedItemMask[_round];
+    _graspDebug.tracking = false;
+    _phase = TaskPhase::CollectSkipping;
+    loadSkippedPickupRecoveryAction();
+
+    if (_itemIndex + 1 < MATERIALS_PER_BATCH)
+        primePickupVision(_itemIndex + 1);
+}
+
+void MechanismTaskExecutor::advanceAfterPickup()
+{
+    if (++_itemIndex < MATERIALS_PER_BATCH)
+    {
+        primePickupVision(_itemIndex);
+        _phase = TaskPhase::CollectPreparing;
+        // 上一件的存盘/失败恢复均已明确等待升降轴回到Home。
+        loadTurntablePreparationAction(_itemIndex + 1, true);
+        return;
+    }
+
+    startReturnToMaterialRouteAnchor();
+}
+
+bool MechanismTaskExecutor::selectFirstAvailableItem()
+{
+    _itemIndex = 0;
+    while (_itemIndex < MATERIALS_PER_BATCH &&
+           !currentItemAvailable())
+    {
+        ++_itemIndex;
+    }
+    return _itemIndex < MATERIALS_PER_BATCH;
+}
+
+bool MechanismTaskExecutor::selectNextAvailableItem()
+{
+    do
+    {
+        ++_itemIndex;
+    } while (
+        _itemIndex < MATERIALS_PER_BATCH &&
+        !currentItemAvailable());
+    return _itemIndex < MATERIALS_PER_BATCH;
+}
+
+bool MechanismTaskExecutor::currentItemAvailable() const
+{
+    return _itemIndex < MATERIALS_PER_BATCH &&
+           (_collectedItemMask[_round] &
+           static_cast<uint8_t>(1U << _itemIndex)) != 0;
+}
+
+bool MechanismTaskExecutor::hasAvailableItemAfterCurrent() const
+{
+    for (uint8_t index = _itemIndex + 1;
+         index < MATERIALS_PER_BATCH;
+         ++index)
+    {
+        if ((_collectedItemMask[_round] &
+             static_cast<uint8_t>(1U << index)) != 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint8_t MechanismTaskExecutor::currentStorageStackLevel() const
+{
+    if (_round == 0 || _itemIndex >= MATERIALS_PER_BATCH)
+        return 0;
+
+    const uint8_t targetPosition =
+        _batch.storagePositions[_itemIndex];
+    for (uint8_t firstIndex = 0;
+         firstIndex < MATERIALS_PER_BATCH;
+         ++firstIndex)
+    {
+        if (_batchByRound[0].storagePositions[firstIndex] ==
+                targetPosition &&
+            (_collectedItemMask[0] &
+             static_cast<uint8_t>(1U << firstIndex)) != 0)
+        {
+            return 1;
+        }
+    }
+
+    // 第一轮对应位置没有物料时，第二轮自动按第一层高度放置。
+    return 0;
+}
+
 void MechanismTaskExecutor::startReturnToMaterialRouteAnchor()
 {
     _graspVision.stop();
+    _primedItemIndex = -1;
     clearAction();
 
-    if (fabsf(_alignmentForwardOffset) <= 0.1F)
+    if (fabsf(_alignmentForwardOffset) <= 0.1F &&
+        fabsf(_alignmentRightOffset) <= 0.1F)
     {
         _alignmentForwardOffset = 0.0F;
+        _alignmentRightOffset = 0.0F;
         finishStationTask();
         return;
     }
 
-    if (!_forwardPositioner.moveForward(
-            -_alignmentForwardOffset))
+    if (!_forwardPositioner.moveBodyRelative(
+            -_alignmentForwardOffset,
+            -_alignmentRightOffset))
     {
         fail("failed to return material route anchor");
         return;
@@ -668,70 +1415,190 @@ void MechanismTaskExecutor::updateReturnToMaterialRouteAnchor()
 
     _forwardCommandActive = false;
     _alignmentForwardOffset = 0.0F;
+    _alignmentRightOffset = 0.0F;
     finishStationTask();
 }
 
 void MechanismTaskExecutor::loadStorageToRingAction(
     uint8_t traySlot,
     const RingPose &pose,
-    uint8_t stackLevel)
+    uint8_t stackLevel,
+    bool retractAfterPlacement,
+    bool pickupPoseAlreadyPrepared)
 {
     clearAction();
-
     /*
-     * 粗加工圆环识别结束时升降轴位于900。必须先升回安全高度，
-     * 再允许底座和伸缩轴进入车内取料位置。
+     * 粗加工出盘和暂存区第一层使用同一套快速转盘到圆环参数。
+     * 暂存区第二层仍走避障串行路径并使用默认底座参数。
      */
-    addStep(StepKind::Lift, LIFT_HOME);
+    _storageToRoughFastProfile =
+        _phase == TaskPhase::RoughPlacing ||
+        (_phase == TaskPhase::FinalStoring && stackLevel == 0);
 
-    // 升轴完成后，车内取料的其他准备动作可以并行。
-    addStep(
-        StepKind::RotateStorage,
-        TRAY_SLOT_ANGLE[traySlot]);
-    addConcurrentStep(
-        StepKind::RotateBase,
-        BASE_TRAY_TRANSFER);
-    addConcurrentStep(
-        StepKind::Extend,
-        EXTENSION_TRAY_TRANSFER);
-    addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
+    if (!pickupPoseAlreadyPrepared)
+    {
+        /*
+         * 首件进入工位时升降轴仍处于视觉/行驶姿态，完整执行一次
+         * 回Home、底座回盘、伸缩回收、开爪和料盘定位。
+         */
+        addStep(StepKind::Lift, LIFT_HOME);
+        addStep(StepKind::RotateBase, BASE_TRAY_TRANSFER);
+        appendStoragePreparation(
+            traySlot,
+            _steps[_stepCount - 1].group);
+        addConcurrentStep(
+            StepKind::Extend,
+            EXTENSION_TRAY_TRANSFER);
+        addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
+    }
+    else if (!storageSlotPrepared(traySlot))
+    {
+        /*
+         * 正常情况下下一槽已在上一件赴圆环时预转完成。若预转状态
+         * 丢失，仅补做料盘定位，不能带着错误槽位直接下降取料。
+         */
+        addStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[traySlot]);
+    }
+
+    // 连续件可从已经确认完成的车内取料姿态直接下降。
     addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 
-    addSafeRetraction(pose.base);
+    const float placementLiftTarget =
+        pose.lift - stackLevel * MATERIAL_HEIGHT;
+    if (_phase == TaskPhase::FinalStoring && stackLevel > 0)
+    {
+        /*
+         * 第二层已经存在第一层物料，不能使用三轴并行扫掠。
+         * 严格按实车验证顺序：升降到40、伸缩到目标位置、底座
+         * 转到目标角度，最后才下降到第二层放置高度。
+         */
+        addStep(StepKind::Lift, LIFT_HOME);
+        addStep(StepKind::Extend, pose.extension);
+        addStep(StepKind::RotateBase, pose.base);
+        const int8_t nextSlot = nextAvailableTraySlot();
+        if (nextSlot >= 0)
+        {
+            appendStoragePreparation(
+                static_cast<uint8_t>(nextSlot),
+                _steps[_stepCount - 1].group);
+        }
+        addStep(StepKind::Lift, placementLiftTarget);
+    }
+    else
+    {
+        addLiftThenRingTransfer(
+            LIFT_HOME,
+            pose.base,
+            placementLiftTarget,
+            pose.extension,
+            nextAvailableTraySlot());
+    }
 
-    // 底座到达圆环方向后才允许伸出长臂。
-    addStep(StepKind::Extend, pose.extension);
-    addStep(
-        StepKind::Lift,
-        pose.lift - stackLevel * MATERIAL_HEIGHT);
+    // 各轴已按本层对应路径到达圆环完整点位，直接放料。
     addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
 
-    addSafeRetraction(BASE_TRAY_TRANSFER);
+    /*
+     * 圆环放料后先竖直脱离物料，再开始旋转或伸缩返回。
+     * 升降坐标越小位置越高，因此上抬量从放置目标中减去。
+     */
+    addStep(
+        StepKind::Lift,
+        max(
+            LIFT_HOME,
+            placementLiftTarget -
+                RING_PLACEMENT_RELEASE_LIFT));
+
+    /*
+     * 粗加工最后一件放下后，下一动作会直接取回第一件。此时不再
+     * 先回车内交接位，避免底座和伸缩轴做一次无意义的往返。
+     * 进入取回动作后仍会先升至安全高度，再转向第一个圆环。
+    */
+    if (retractAfterPlacement)
+    {
+        if (_phase == TaskPhase::RoughPlacing)
+        {
+            addRoughRingToTrayRetraction(
+                _batch.roughPositions[_itemIndex]);
+        }
+        else if (stackLevel > 0)
+        {
+            /*
+             * 第二层放置后的返程仍避障：先升至Home，再完全收回
+             * 伸缩轴，最后旋转底座回储料盘。
+             */
+            addStep(StepKind::Lift, LIFT_HOME);
+            addStep(StepKind::Extend, EXTENSION_HOME);
+            addStep(StepKind::RotateBase, BASE_TRAY_TRANSFER);
+        }
+        else
+        {
+            // 第一层尚无垛料障碍，恢复原来的三轴并行回盘。
+            addParallelTransfer(BASE_TRAY_TRANSFER);
+        }
+    }
 }
 
 void MechanismTaskExecutor::loadRingToStorageAction(
     uint8_t traySlot,
-    const RingPose &pose)
+    const RingPose &pose,
+    bool directRingSwitch)
 {
     clearAction();
+    // 普通取回从储料盘出发；第三件放置后的首次取回属于圆环直切。
+    _storageToRoughFastProfile = !directRingSwitch;
 
-    // 每次圆环取回都先确认升降轴处于安全高度，再移动其他轴。
-    addStep(StepKind::Lift, LIFT_HOME);
+    uint8_t ringArrivalGroup = 0;
+    if (directRingSwitch)
+    {
+        /*
+         * 圆环直切必须在整个横向扫掠期间保持安全高度。
+         * 先单轴抬升，再只并行旋转底座和移动伸缩轴；不在
+         * 旋转期间下降。
+         */
+        addStep(StepKind::Lift, LIFT_RING_SWITCH_CLEARANCE);
+        addStep(StepKind::RotateBase, pose.base);
+        ringArrivalGroup = _steps[_stepCount - 1].group;
+        appendStep(
+            StepKind::Extend,
+            pose.extension,
+            ringArrivalGroup);
+    }
+    else
+    {
+        // 储料盘到圆环：先单轴到Home，然后三轴并行到点。
+        addLiftThenRingTransfer(
+            LIFT_HOME,
+            pose.base,
+            pose.lift,
+            pose.extension);
+        ringArrivalGroup = _steps[_stepCount - 1].group;
+    }
 
-    addStep(
-        StepKind::RotateStorage,
-        TRAY_SLOT_ANGLE[traySlot]);
-    addConcurrentStep(StepKind::RotateBase, pose.base);
-    addConcurrentStep(StepKind::OpenGripperMax, GRIPPER_OPEN_MAX_ANGLE);
+    // 圆环抓取使用普通开度，载物盘预旋转也在赴圆环时完成。
+    appendStoragePreparation(traySlot, ringArrivalGroup);
+    appendStep(
+        StepKind::OpenGripper,
+        GRIPPER_OPEN_ANGLE,
+        ringArrivalGroup);
 
-    // 底座到达圆环方向后再伸出。
-    addStep(StepKind::Extend, pose.extension);
-    addStep(StepKind::Lift, pose.lift);
+    if (directRingSwitch)
+    {
+        // 底座和伸缩完全到位后，才允许从安全高度下降。
+        addStep(StepKind::Lift, pose.lift);
+    }
+
     addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
 
-    addSafeRetraction(BASE_TRAY_TRANSFER);
-    addStorageDeposit();
+    // 先从圆环竖直提起物料，再进入慢速并行回盘动作。
+    addStep(
+        StepKind::Lift,
+        max(
+            LIFT_HOME,
+            pose.lift - RING_PICKUP_RELEASE_LIFT));
+    addRoughRingToTrayRetraction(
+        _batch.roughPositions[_itemIndex]);
+    addStorageDeposit(hasAvailableItemAfterCurrent());
 }
 
 bool MechanismTaskExecutor::updateCurrentStep()
@@ -781,6 +1648,9 @@ bool MechanismTaskExecutor::updateActionStep(ActionStep &step)
         return updateStepperStep(_extension, step, false);
 
     case StepKind::RotateBase:
+    case StepKind::RotateBaseRoughCalibration:
+    case StepKind::RotateBaseRoughReturn:
+    case StepKind::RotateBaseRoughReturnCalibration:
         return updateStepperStep(_base, step, true);
 
     case StepKind::RotateStorage:
@@ -794,6 +1664,152 @@ bool MechanismTaskExecutor::updateActionStep(ActionStep &step)
     return false;
 }
 
+bool MechanismTaskExecutor::issueStepperCommand(
+    TTL_Stepper &motor,
+    ActionStep &step,
+    bool angle)
+{
+    resetStepperState(motor);
+    bool commandAccepted = false;
+    if (angle)
+    {
+        uint16_t velocity = BASE_SPEED;
+        uint8_t acceleration = BASE_ACCELERATION;
+
+        if (_storageToRoughFastProfile &&
+            _itemIndex < MATERIALS_PER_BATCH)
+        {
+            const bool finalStorage =
+                _phase == TaskPhase::FinalStoring;
+            const uint8_t ring =
+                finalStorage
+                    ? _batch.storagePositions[_itemIndex]
+                    : _batch.roughPositions[_itemIndex];
+            if (validRing(ring))
+            {
+                const RingPose &targetPose =
+                    finalStorage
+                        ? FINAL_STORAGE_RING_POSES[ring]
+                        : ROUGH_RING_POSES[ring];
+                const bool movingToRing =
+                    fabsf(
+                        step.target -
+                        targetPose.base) < 0.5F;
+                if (movingToRing)
+                {
+                    velocity =
+                        TRAY_TO_ROUGH_RING_BASE_SPEED;
+                    acceleration =
+                        TRAY_TO_ROUGH_RING_BASE_ACCELERATION;
+                }
+            }
+        }
+
+        if (step.kind == StepKind::RotateBaseRoughCalibration &&
+            _roughPlacementCalibrationActive)
+        {
+            velocity = _roughPlacementCalibrationSpeed;
+            acceleration =
+                _roughPlacementCalibrationAcceleration;
+        }
+        else if (step.kind ==
+                     StepKind::RotateBaseRoughReturnCalibration &&
+                 _roughReturnCalibrationActive)
+        {
+            velocity = _roughReturnCalibrationSpeed;
+            acceleration =
+                _roughReturnCalibrationAcceleration;
+        }
+        else if (step.kind == StepKind::RotateBaseRoughReturn &&
+                 _itemIndex < MATERIALS_PER_BATCH)
+        {
+            const uint8_t ring =
+                _batch.roughPositions[_itemIndex];
+            if (validRing(ring))
+            {
+                velocity = ROUGH_RING_TO_TRAY_SPEED[ring];
+                acceleration =
+                    ROUGH_RING_TO_TRAY_ACCELERATION[ring];
+            }
+        }
+
+        commandAccepted = motor.setAngle(
+            step.target,
+            velocity,
+            acceleration);
+    }
+    else
+    {
+        uint16_t velocity = motor.Speed;
+        uint8_t acceleration = motor.Acceleration;
+        if (&motor == &_lift &&
+            _motionDebug.liftCommandCount > 0 &&
+            step.target < _motionDebug.liftTarget - 0.5F)
+        {
+            // 本项目中升降坐标越小位置越高。
+            velocity = LIFT_UP_SPEED;
+            acceleration = LIFT_UP_ACCELERATION;
+        }
+        else if (&motor == &_extension &&
+            _phase == TaskPhase::CollectAligning)
+        {
+            velocity = PICKUP_EXTENSION_TRACK_SPEED;
+            acceleration =
+                PICKUP_EXTENSION_TRACK_ACCELERATION;
+        }
+
+        commandAccepted = motor.runToNewPosition(
+            step.target,
+            velocity,
+            acceleration);
+    }
+
+    if (!commandAccepted)
+    {
+        fail(stepperCommandFaultMessage(motor));
+        return false;
+    }
+
+    step.issued = true;
+    step.startedMs = millis();
+    step.lastPollMs = 0;
+
+    if (&motor == &_lift)
+    {
+        _motionDebug.liftTarget = step.target;
+        _motionDebug.liftIssuedMs = step.startedMs;
+        if (fabsf(step.target - LIFT_HOME) < 0.5F)
+            _motionDebug.liftHomeConfirmedMs = 0;
+        ++_motionDebug.liftCommandCount;
+    }
+    else if (&motor == &_extension)
+    {
+        _motionDebug.extensionTarget = step.target;
+        _motionDebug.extensionIssuedMs = step.startedMs;
+        ++_motionDebug.extensionCommandCount;
+    }
+    else
+    {
+        _motionDebug.baseTarget = step.target;
+        _motionDebug.baseIssuedMs = step.startedMs;
+        ++_motionDebug.baseCommandCount;
+        if (step.kind == StepKind::RotateBaseRoughCalibration)
+        {
+            _motionDebug.roughPlacementIssuedMs =
+                step.startedMs;
+            _motionDebug.roughPlacementConfirmedMs = 0;
+        }
+        else if (step.kind ==
+                 StepKind::RotateBaseRoughReturnCalibration)
+        {
+            _motionDebug.roughReturnIssuedMs =
+                step.startedMs;
+            _motionDebug.roughReturnConfirmedMs = 0;
+        }
+    }
+    return true;
+}
+
 bool MechanismTaskExecutor::updateStepperStep(
     TTL_Stepper &motor,
     ActionStep &step,
@@ -802,29 +1818,13 @@ bool MechanismTaskExecutor::updateStepperStep(
     const uint32_t now = millis();
     if (!step.issued)
     {
-        resetStepperState(motor);
-        bool commandAccepted = false;
-        if (angle)
-            commandAccepted = motor.setAngle(step.target);
-        else
-            commandAccepted =
-                motor.runToNewPosition(step.target);
-
-        if (!commandAccepted)
-        {
-            fail(stepperCommandFaultMessage(motor));
-            return false;
-        }
-
-        step.issued = true;
-        step.startedMs = now;
-        step.lastPollMs = 0;
+        issueStepperCommand(motor, step, angle);
         return false;
     }
 
     if (now - step.startedMs >= STEPPER_TIMEOUT_MS)
     {
-        fail("mechanism stepper timeout");
+        fail(stepperTimeoutMessage(motor));
         return false;
     }
 
@@ -840,8 +1840,37 @@ bool MechanismTaskExecutor::updateStepperStep(
     if (motor.onPos_state)
     {
         step.faultFeedbackCount = 0;
+        const bool criticalLiftTarget =
+            &motor == &_lift &&
+            (fabsf(step.target - LIFT_HOME) < 0.5F ||
+             fabsf(
+                 step.target -
+                 LIFT_RING_SWITCH_CLEARANCE) < 0.5F);
+        if (criticalLiftTarget)
+        {
+            if (step.onPositionFeedbackCount < LIFT_CRITICAL_CONFIRM_COUNT)
+                ++step.onPositionFeedbackCount;
+            if (step.onPositionFeedbackCount < LIFT_CRITICAL_CONFIRM_COUNT)
+                return false;
+
+            if (fabsf(step.target - LIFT_HOME) < 0.5F)
+                _motionDebug.liftHomeConfirmedMs = now;
+        }
+        if (step.kind == StepKind::RotateBaseRoughCalibration &&
+            _motionDebug.roughPlacementConfirmedMs == 0)
+        {
+            _motionDebug.roughPlacementConfirmedMs = now;
+        }
+        if (step.kind ==
+                StepKind::RotateBaseRoughReturnCalibration &&
+            _motionDebug.roughReturnConfirmedMs == 0)
+        {
+            _motionDebug.roughReturnConfirmedMs = now;
+        }
         return true;
     }
+
+    step.onPositionFeedbackCount = 0;
 
     if (motor.locked_state || motor.loPro_state)
     {
@@ -883,6 +1912,22 @@ bool MechanismTaskExecutor::pollStepperState(
             return false;
         }
 
+        /*
+         * 应答丢失或只收到残帧时，供应商库会让Ask_State
+         * 永久保持true。清除本次查询并释放共享总线，
+         * 下一个轮询周期会自动重新发送状态查询。
+         */
+        if (motor.Ask_State &&
+            step.queryStartedMs != 0 &&
+            now - step.queryStartedMs >=
+                STEPPER_QUERY_RESPONSE_TIMEOUT_MS)
+        {
+            motor.recDate_Clear();
+            step.queryStartedMs = 0;
+            _sharedPollOwner = nullptr;
+            return false;
+        }
+
         if (now - _lastSharedBusPollMs < STEPPER_POLL_MS)
             return false;
 
@@ -893,10 +1938,26 @@ bool MechanismTaskExecutor::pollStepperState(
         const bool responsePending = motor.Ask_State;
         motor.state_update();
 
+        if (!responsePending && motor.Ask_State)
+            step.queryStartedMs = now;
+
         // Ask_State清零表示该电机的应答已经完整解析。
         if (!motor.Ask_State)
+        {
+            step.queryStartedMs = 0;
             _sharedPollOwner = nullptr;
+        }
         return responsePending && !motor.Ask_State;
+    }
+
+    if (motor.Ask_State &&
+        step.queryStartedMs != 0 &&
+        now - step.queryStartedMs >=
+            STEPPER_QUERY_RESPONSE_TIMEOUT_MS)
+    {
+        motor.recDate_Clear();
+        step.queryStartedMs = 0;
+        return false;
     }
 
     if (step.lastPollMs != 0 &&
@@ -906,6 +1967,10 @@ bool MechanismTaskExecutor::pollStepperState(
     step.lastPollMs = now;
     const bool responsePending = motor.Ask_State;
     motor.state_update();
+    if (!responsePending && motor.Ask_State)
+        step.queryStartedMs = now;
+    else if (!motor.Ask_State)
+        step.queryStartedMs = 0;
     return responsePending && !motor.Ask_State;
 }
 
@@ -922,20 +1987,21 @@ void MechanismTaskExecutor::issueServoStep(ActionStep &step)
          * 实车舵机固件不执行“按速度控制”扩展指令，但标准角度
          * 指令已经由new_project验证。setAngle只下发命令，不等待到位。
          */
+        _preparedStorageSlot = -1;
         _storageServo.setAngle(step.target);
         break;
     case StepKind::OpenGripper:
     case StepKind::OpenGripperMax:
         _gripperServo.setAngle(
             step.target,
-            GRIPPER_COMMAND_INTERVAL_MS,
+            GRIPPER_OPEN_INTERVAL_MS,
             0);
         break;
     case StepKind::CloseGripperUnloaded:
     case StepKind::CloseGripper:
         _gripperServo.setAngle(
             step.target,
-            GRIPPER_COMMAND_INTERVAL_MS,
+            GRIPPER_CLOSE_INTERVAL_MS,
             GRIPPER_MAX_POWER);
         break;
     default:
@@ -946,10 +2012,33 @@ void MechanismTaskExecutor::issueServoStep(ActionStep &step)
 bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
 {
     if (!step.issued)
+    {
         issueServoStep(step);
+        return false;
+    }
 
-    // 不再读取角度或功率：命令写入串口后即视为舵机步骤完成。
-    return true;
+    const uint32_t elapsed = millis() - step.startedMs;
+    if (step.kind == StepKind::RotateStorage)
+    {
+        if (elapsed < STORAGE_SERVO_SETTLE_MS)
+            return false;
+        _preparedStorageSlot = storageSlotFromAngle(step.target);
+        return true;
+    }
+
+    /*
+     * FashionStar角度查询会同步等待串口应答。比赛主循环采用确定的
+     * 命令时长加稳定余量，避免查询阻塞底盘，同时保证夹爪完成动作
+     * 后才允许升降。
+     */
+    const uint16_t interval =
+        step.kind == StepKind::OpenGripper ||
+                step.kind == StepKind::OpenGripperMax
+            ? GRIPPER_OPEN_INTERVAL_MS
+            : GRIPPER_CLOSE_INTERVAL_MS;
+    return elapsed >=
+           static_cast<uint32_t>(interval) +
+               GRIPPER_SETTLE_MS;
 }
 
 void MechanismTaskExecutor::onActionCompleted()
@@ -975,16 +2064,24 @@ void MechanismTaskExecutor::onActionCompleted()
         startPickupAlignment();
         break;
 
+    case TaskPhase::CollectApproaching:
+        /*
+         * 下降前已经完成视觉对准；升降轴到位后直接闭爪，不再执行
+         * 低位二次视觉检测或等待新帧。
+         */
+        startGripperClosing();
+        break;
+
+    case TaskPhase::CollectGrasping:
+        acceptPickup();
+        break;
+
     case TaskPhase::CollectDepositing:
-        if (++_itemIndex < MATERIALS_PER_BATCH)
-        {
-            _phase = TaskPhase::CollectPreparing;
-            loadTurntablePreparationAction(_itemIndex + 1);
-        }
-        else
-        {
-            startReturnToMaterialRouteAnchor();
-        }
+        advanceAfterPickup();
+        break;
+
+    case TaskPhase::CollectSkipping:
+        advanceAfterPickup();
         break;
 
     case TaskPhase::CollectAligning:
@@ -996,27 +2093,36 @@ void MechanismTaskExecutor::onActionCompleted()
         break;
 
     case TaskPhase::RoughPlacing:
-        if (++_itemIndex < MATERIALS_PER_BATCH)
+        if (selectNextAvailableItem())
         {
             loadStorageToRingAction(
                 _itemIndex + 1,
                 ROUGH_RING_POSES[
                     _batch.roughPositions[_itemIndex]],
-                0);
+                0,
+                hasAvailableItemAfterCurrent(),
+                true);
         }
         else
         {
-            _itemIndex = 0;
             _phase = TaskPhase::RoughRetrieving;
-            loadRingToStorageAction(
-                1,
-                ROUGH_RING_POSES[
-                    _batch.roughPositions[0]]);
+            if (selectFirstAvailableItem())
+            {
+                loadRingToStorageAction(
+                    _itemIndex + 1,
+                    ROUGH_RING_POSES[
+                        _batch.roughPositions[_itemIndex]],
+                    true);
+            }
+            else
+            {
+                finishStationTask();
+            }
         }
         break;
 
     case TaskPhase::RoughRetrieving:
-        if (++_itemIndex < MATERIALS_PER_BATCH)
+        if (selectNextAvailableItem())
         {
             loadRingToStorageAction(
                 _itemIndex + 1,
@@ -1030,18 +2136,34 @@ void MechanismTaskExecutor::onActionCompleted()
         break;
 
     case TaskPhase::FinalStoring:
-        if (++_itemIndex < MATERIALS_PER_BATCH)
+        if (selectNextAvailableItem())
         {
             loadStorageToRingAction(
                 _itemIndex + 1,
                 FINAL_STORAGE_RING_POSES[
                     _batch.storagePositions[_itemIndex]],
-                _round);
+                currentStorageStackLevel(),
+                hasAvailableItemAfterCurrent(),
+                true);
         }
         else
         {
             finishStationTask();
         }
+        break;
+
+    case TaskPhase::CalibratingRoughPlacement:
+        _roughPlacementCalibrationActive = false;
+        _phase = TaskPhase::Idle;
+        _result = AsyncResult::Succeeded;
+        clearAction();
+        break;
+
+    case TaskPhase::CalibratingRoughReturn:
+        _roughReturnCalibrationActive = false;
+        _phase = TaskPhase::Idle;
+        _result = AsyncResult::Succeeded;
+        clearAction();
         break;
 
     case TaskPhase::Idle:
@@ -1091,6 +2213,16 @@ const char *MechanismTaskExecutor::stepperCommandFaultMessage(
     return "base stepper command failed";
 }
 
+const char *MechanismTaskExecutor::stepperTimeoutMessage(
+    const TTL_Stepper &motor) const
+{
+    if (&motor == &_lift)
+        return "lift stepper timeout";
+    if (&motor == &_extension)
+        return "extension stepper timeout";
+    return "base stepper timeout";
+}
+
 void MechanismTaskExecutor::fail(const char *message)
 {
     _graspVision.stop();
@@ -1120,6 +2252,16 @@ void MechanismTaskExecutor::resetStepperState(TTL_Stepper &motor)
 bool MechanismTaskExecutor::validRing(uint8_t ring)
 {
     return ring >= 1 && ring <= 3;
+}
+
+int8_t MechanismTaskExecutor::storageSlotFromAngle(float angle)
+{
+    for (uint8_t slot = 0; slot <= MATERIALS_PER_BATCH; ++slot)
+    {
+        if (fabsf(angle - TRAY_SLOT_ANGLE[slot]) < 0.5F)
+            return static_cast<int8_t>(slot);
+    }
+    return -1;
 }
 
 float MechanismTaskExecutor::clampValue(

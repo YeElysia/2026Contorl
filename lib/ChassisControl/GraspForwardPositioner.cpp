@@ -8,13 +8,15 @@ GraspForwardPositioner::GraspForwardPositioner(
 {
 }
 
-bool GraspForwardPositioner::moveForward(float distanceMm)
+bool GraspForwardPositioner::moveBodyRelative(
+    float forwardMm,
+    float rightMm)
 {
-    return _chassis.moveBodyRelative(
-        distanceMm,
-        0.0F,
-        chassis_config::PRECISE_DRIVE_RPM,
-        chassis_config::PRECISE_DRIVE_ACCEL_RPM_PER_S);
+    return _chassis.moveBodyRelativeTracking(
+        forwardMm,
+        rightMm,
+        chassis_config::GRASP_TRACK_DRIVE_RPM,
+        chassis_config::GRASP_TRACK_ACCEL_RPM_PER_S);
 }
 
 bool GraspForwardPositioner::busy() const

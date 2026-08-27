@@ -1,13 +1,17 @@
 #include "ChassisControl.h"
 
+#include "ChassisEmm42TtlFeedback.h"
 #include "chassis_config.h"
 #include <math.h>
 #include <string.h>
 
 using namespace chassis_config;
 
-ChassisControl::ChassisControl(HardwareSerial *imuSerial)
+ChassisControl::ChassisControl(
+    HardwareSerial *imuSerial,
+    ChassisEmm42TtlFeedback *motorFeedback)
     : _imuSerial(imuSerial),
+      _motorFeedback(motorFeedback),
       _motors{
           AccelStepper(AccelStepper::DRIVER, STEP_PINS[0], DIR_PINS[0]),
           AccelStepper(AccelStepper::DRIVER, STEP_PINS[1], DIR_PINS[1]),
@@ -28,6 +32,7 @@ void ChassisControl::begin()
     {
         motor.setMaxSpeed(maxSpeed);
         motor.setAcceleration(acceleration);
+        motor.setMinPulseWidth(STEP_PULSE_WIDTH_US);
         motor.setCurrentPosition(0);
     }
     for (uint8_t i = 0; i < 4; ++i)
@@ -35,6 +40,8 @@ void ChassisControl::begin()
 
     if (_imuSerial != nullptr)
         _imuSerial->begin(IMU_BAUD);
+    if (_motorFeedback != nullptr)
+        _motorFeedback->begin();
 
     _worldPose = {0.0F, 0.0F, 0.0F};
     _worldYawOffsetDeg = 0.0F;
@@ -46,13 +53,26 @@ void ChassisControl::begin()
 void ChassisControl::update()
 {
     updateImu();
+    if (_motorFeedback != nullptr)
+    {
+        _motorFeedback->update();
+        if (_state != State::Fault &&
+            !_motorFeedback->healthy())
+        {
+            setFault(_motorFeedback->faultMessage());
+            return;
+        }
+    }
     updateOdometry();
 
     if (_state != State::Idle &&
         _state != State::Fault &&
-        millis() - _motionStartMs > MOTION_TIMEOUT_MS)
+        millis() - _motionStartMs > _motionTimeoutMs)
     {
-        setFault("motion timeout");
+        setFault(
+            _state == State::Stopping
+                ? "chassis stop timeout"
+                : "chassis motion timeout");
         return;
     }
 
@@ -63,6 +83,9 @@ void ChassisControl::update()
         break;
     case State::Rotating:
         updateRotation();
+        break;
+    case State::Stopping:
+        updateStopping();
         break;
     default:
         break;
@@ -78,10 +101,46 @@ bool ChassisControl::moveBodyRelative(
     float maxRpm,
     float accelerationRpmPerS)
 {
+    return moveBodyRelativeInternal(
+        forwardMm,
+        rightMm,
+        maxRpm,
+        accelerationRpmPerS,
+        true);
+}
+
+bool ChassisControl::moveBodyRelativeTracking(
+    float forwardMm,
+    float rightMm,
+    float maxRpm,
+    float accelerationRpmPerS)
+{
+    return moveBodyRelativeInternal(
+        forwardMm,
+        rightMm,
+        maxRpm,
+        accelerationRpmPerS,
+        false);
+}
+
+bool ChassisControl::moveBodyRelativeInternal(
+    float forwardMm,
+    float rightMm,
+    float maxRpm,
+    float accelerationRpmPerS,
+    bool finalHeadingSettle)
+{
     // 一次只允许执行一个运动命令。发生故障后需要先调用 clearFault()。
     if (busy() || _state == State::Fault)
         return false;
-    if (maxRpm <= 0.0f || accelerationRpmPerS <= 0.0f)
+    if (!isfinite(forwardMm) ||
+        !isfinite(rightMm) ||
+        !isfinite(maxRpm) ||
+        !isfinite(accelerationRpmPerS) ||
+        maxRpm <= 0.0f ||
+        accelerationRpmPerS <= 0.0f ||
+        fabsf(forwardMm) > MAX_SINGLE_MOVE_COMPONENT_MM ||
+        fabsf(rightMm) > MAX_SINGLE_MOVE_COMPONENT_MM)
         return false;
 
     /*
@@ -96,11 +155,21 @@ bool ChassisControl::moveBodyRelative(
      *   左后 = 前进 - 右移
      *   右后 = 前进 + 右移
      */
+    const float calibratedForwardMm =
+        forwardMm * distanceScale(
+                        forwardMm,
+                        FORWARD_DISTANCE_SCALE,
+                        BACKWARD_DISTANCE_SCALE);
+    const float calibratedRightMm =
+        rightMm * distanceScale(
+                      rightMm,
+                      RIGHT_DISTANCE_SCALE,
+                      LEFT_DISTANCE_SCALE);
     const float wheelMm[4] = {
-        forwardMm + rightMm,
-        forwardMm - rightMm,
-        forwardMm - rightMm,
-        forwardMm + rightMm};
+        calibratedForwardMm + calibratedRightMm,
+        calibratedForwardMm - calibratedRightMm,
+        calibratedForwardMm - calibratedRightMm,
+        calibratedForwardMm + calibratedRightMm};
 
     bool hasMotion = false;
     long wheelPulses[4] = {};
@@ -150,7 +219,15 @@ bool ChassisControl::moveBodyRelative(
     _holdYawDeg = _yawDeg;
     _translationHeadingEnabled =
         ENABLE_HEADING_HOLD && imuReady();
+    _translationFinalHeadingSettleEnabled =
+        finalHeadingSettle;
+    _translationPhase = TranslationPhase::Driving;
+    resetYawStability();
     _motionStartMs = millis();
+    _motionTimeoutMs = estimateTranslationTimeoutMs(
+        maximumPulses,
+        maximumSpeed,
+        maximumAcceleration);
     _state = State::Translating;
     return true;
 }
@@ -212,6 +289,8 @@ bool ChassisControl::rotateTo(float absoluteYawDeg)
 {
     if (busy() || _state == State::Fault)
         return false;
+    if (!isfinite(absoluteYawDeg))
+        return false;
     if (!imuReady())
     {
         setFault("rotate rejected: IMU not ready");
@@ -219,8 +298,10 @@ bool ChassisControl::rotateTo(float absoluteYawDeg)
     }
 
     _rotateTargetDeg = wrap180(absoluteYawDeg);
-    _stableSamples = 0;
+    resetYawStability();
     _motionStartMs = millis();
+    _motionTimeoutMs = estimateRotationTimeoutMs(
+        fabsf(wrap180(_rotateTargetDeg - _yawDeg)));
     _state = State::Rotating;
     return true;
 }
@@ -239,23 +320,35 @@ bool ChassisControl::rotateWorldTo(float worldYawDeg)
 
 void ChassisControl::stop()
 {
+    if (_state == State::Fault)
+    {
+        syncTargets();
+        return;
+    }
+
+    if (_state == State::Idle)
+    {
+        syncTargets();
+        return;
+    }
+
+    /*
+     * 不在stop()里阻塞一秒。给每个轴生成减速目标，后续由update()
+     * 持续产生脉冲，这样IMU、视觉和机构状态机不会被底盘急停卡住。
+     */
     for (auto &motor : _motors)
         motor.stop();
 
-    const uint32_t start = millis();
-    while (!allMotorsStopped() && millis() - start < 1000)
-    {
-        for (auto &motor : _motors)
-            motor.run();
-    }
-    syncTargets();
-    if (_state != State::Fault)
-        _state = State::Idle;
+    _motionStartMs = millis();
+    _motionTimeoutMs = STOP_TIMEOUT_MS;
+    _state = State::Stopping;
 }
 
 void ChassisControl::clearFault()
 {
-    stop();
+    syncTargets();
+    if (_motorFeedback != nullptr)
+        _motorFeedback->clearFault();
     _fault[0] = '\0';
     _state = State::Idle;
 }
@@ -267,7 +360,9 @@ ChassisControl::State ChassisControl::state() const
 
 bool ChassisControl::busy() const
 {
-    return _state == State::Translating || _state == State::Rotating;
+    return _state == State::Translating ||
+           _state == State::Rotating ||
+           _state == State::Stopping;
 }
 
 bool ChassisControl::imuReady() const
@@ -293,6 +388,10 @@ bool ChassisControl::resetWorldPose(
 {
     if (busy())
         return false;
+    if (!isfinite(worldXmm) ||
+        !isfinite(worldYmm) ||
+        !isfinite(worldYawDeg))
+        return false;
 
     _worldPose.xMm = worldXmm;
     _worldPose.yMm = worldYmm;
@@ -315,6 +414,24 @@ bool ChassisControl::resetWorldPose(
         _worldYawOffsetReady = false;
     }
 
+    for (uint8_t i = 0; i < 4; ++i)
+        _lastOdometrySteps[i] = _motors[i].currentPosition();
+    return true;
+}
+
+bool ChassisControl::correctWorldPosition(
+    float worldXmm,
+    float worldYmm)
+{
+    if (busy() ||
+        !isfinite(worldXmm) ||
+        !isfinite(worldYmm))
+    {
+        return false;
+    }
+
+    _worldPose.xMm = worldXmm;
+    _worldPose.yMm = worldYmm;
     for (uint8_t i = 0; i < 4; ++i)
         _lastOdometrySteps[i] = _motors[i].currentPosition();
     return true;
@@ -356,6 +473,7 @@ bool ChassisControl::updateImu()
             _yawDeg = rawYaw / 32768.0f * 180.0f;
             _lastImuMs = millis();
             _imuReady = true;
+            ++_imuSequence;
             if (!_worldYawOffsetReady)
             {
                 _worldYawOffsetDeg =
@@ -393,14 +511,26 @@ void ChassisControl::updateOdometry()
      * 麦轮正解算。四轮共同的旋转分量在这两个平移组合中抵消，
      * 所以旋转由IMU记录，x/y只累计实际产生的平移脉冲。
      */
-    const float forwardMm =
+    const float calibratedForwardMm =
         (wheelMm[0] + wheelMm[1] +
          wheelMm[2] + wheelMm[3]) *
         0.25F;
-    const float rightMm =
+    const float calibratedRightMm =
         (wheelMm[0] - wheelMm[1] -
          wheelMm[2] + wheelMm[3]) *
         0.25F;
+    const float forwardMm =
+        calibratedForwardMm /
+        distanceScale(
+            calibratedForwardMm,
+            FORWARD_DISTANCE_SCALE,
+            BACKWARD_DISTANCE_SCALE);
+    const float rightMm =
+        calibratedRightMm /
+        distanceScale(
+            calibratedRightMm,
+            RIGHT_DISTANCE_SCALE,
+            LEFT_DISTANCE_SCALE);
 
     float worldXMm = 0.0F;
     float worldYMm = 0.0F;
@@ -419,6 +549,15 @@ void ChassisControl::updateTranslation()
     if (_translationHeadingEnabled && !imuReady())
     {
         setFault("IMU stale while translating");
+        return;
+    }
+
+    if (_translationPhase == TranslationPhase::HeadingSettling)
+    {
+        if (updateYawSettle(
+                _holdYawDeg,
+                TRANSLATION_FINAL_HEADING_TOLERANCE_DEG))
+            _state = State::Idle;
         return;
     }
 
@@ -467,7 +606,21 @@ void ChassisControl::updateTranslation()
     if (allMotorsStopped())
     {
         syncTargets();
-        _state = State::Idle;
+        if (_translationHeadingEnabled &&
+            _translationFinalHeadingSettleEnabled)
+        {
+            /*
+             * 行程完成不等于动作完成。巡航阶段的航向修正受各轮剩余
+             * 行程约束，最终再做一次小角度原地收敛，避免误差传给
+             * 下一段世界坐标路线或视觉对准。
+             */
+            _translationPhase = TranslationPhase::HeadingSettling;
+            resetYawStability();
+        }
+        else
+        {
+            _state = State::Idle;
+        }
     }
 }
 
@@ -479,28 +632,145 @@ void ChassisControl::updateRotation()
         return;
     }
 
-    const float error = wrap180(_rotateTargetDeg - _yawDeg);
-    if (fabsf(error) <= ROTATE_TOLERANCE_DEG)
+    if (updateYawSettle(_rotateTargetDeg, ROTATE_TOLERANCE_DEG))
+        _state = State::Idle;
+}
+
+void ChassisControl::updateStopping()
+{
+    for (auto &motor : _motors)
+        motor.run();
+
+    if (allMotorsStopped())
     {
-        if (++_stableSamples >= ROTATE_STABLE_SAMPLES)
+        syncTargets();
+        _state = State::Idle;
+    }
+}
+
+bool ChassisControl::updateYawSettle(
+    float targetYawDeg,
+    float toleranceDeg)
+{
+    const float error = wrap180(targetYawDeg - _yawDeg);
+    if (fabsf(error) <= toleranceDeg)
+    {
+        // 进入容差带后停止继续发脉冲；若被惯性带出，再从零平滑纠偏。
+        _rotateCommandSpeed = 0.0F;
+
+        /*
+         * loop频率远高于IMU输出频率。只有收到一帧新的有效角度数据
+         * 才增加稳定计数，避免在同一帧上空转五次就误判完成。
+         */
+        if (_lastEvaluatedImuSequence == _imuSequence)
+            return false;
+
+        _lastEvaluatedImuSequence = _imuSequence;
+        if (_stableSamples == 0)
+            _stableSinceMs = millis();
+        if (_stableSamples < UINT8_MAX)
+            ++_stableSamples;
+
+        if (_stableSamples >= ROTATE_STABLE_SAMPLES &&
+            millis() - _stableSinceMs >= ROTATE_STABLE_TIME_MS)
         {
             syncTargets();
-            _state = State::Idle;
+            return true;
         }
-        return;
+        return false;
     }
-    _stableSamples = 0;
 
+    if (_lastEvaluatedImuSequence != _imuSequence)
+    {
+        _lastEvaluatedImuSequence = _imuSequence;
+        _stableSamples = 0;
+        _stableSinceMs = 0;
+    }
+    runYawController(error);
+    return false;
+}
+
+void ChassisControl::runYawController(float errorDeg)
+{
     const float limit = rpmToStepsPerSecond(ROTATE_MAX_RPM);
-    const float speed = constrain(
-        error * ROTATE_KP_STEPS_PER_S_PER_DEG, -limit, limit);
+    const float acceleration =
+        rpmToStepsPerSecond(ROTATE_ACCEL_RPM_PER_S);
+
+    /*
+     * 只在收到新IMU帧时更新角速度，避免主循环在同一帧上重复微分。
+     * 一阶低通压制JY901角度量化噪声，PD的D项用于接近目标时提前制动。
+     */
+    if (_rotateLastImuSequence != _imuSequence)
+    {
+        const uint32_t sampleMs = _lastImuMs;
+        const uint32_t elapsedMs = sampleMs - _rotateLastYawMs;
+        if (elapsedMs > 0)
+        {
+            const float instantaneousYawRate =
+                wrap180(_yawDeg - _rotateLastYawDeg) *
+                1000.0F / static_cast<float>(elapsedMs);
+            _rotateFilteredYawRate +=
+                ROTATE_YAW_RATE_FILTER_ALPHA *
+                (instantaneousYawRate - _rotateFilteredYawRate);
+        }
+        _rotateLastYawDeg = _yawDeg;
+        _rotateLastYawMs = sampleMs;
+        _rotateLastImuSequence = _imuSequence;
+    }
+
+    float targetSpeed = constrain(
+        errorDeg * ROTATE_KP_STEPS_PER_S_PER_DEG -
+            _rotateFilteredYawRate *
+                ROTATE_KD_STEPS_PER_S_PER_DEG_PER_S,
+        -limit,
+        limit);
+    if (targetSpeed * errorDeg > 0.0F &&
+        fabsf(targetSpeed) < ROTATE_MIN_STEPS_PER_S)
+    {
+        targetSpeed = copysignf(ROTATE_MIN_STEPS_PER_S, errorDeg);
+    }
+
+    /*
+     * AccelStepper::runSpeed()本身不使用setAcceleration()。这里按真实
+     * 时间限制每次速度变化量，使ROTATE_ACCEL_RPM_PER_S实际生效。
+     */
+    const uint32_t nowUs = micros();
+    const float elapsedSeconds = min(
+        static_cast<float>(nowUs - _rotateLastControlUs) * 1.0e-6F,
+        0.05F);
+    _rotateLastControlUs = nowUs;
+    const float maximumDelta = acceleration * elapsedSeconds;
+    _rotateCommandSpeed += constrain(
+        targetSpeed - _rotateCommandSpeed,
+        -maximumDelta,
+        maximumDelta);
 
     // 当前接线下，四个电机同号脉冲对应原地旋转。
     for (auto &motor : _motors)
     {
-        motor.setSpeed(speed);
+        /*
+         * 前一次斜移可能给四轮留下不同的maxSpeed/acceleration。
+         * 原地旋转前必须统一恢复，否则setSpeed()会被各自的旧上限
+         * 裁成不同轮速。
+         */
+        motor.setMaxSpeed(limit);
+        motor.setAcceleration(acceleration);
+        motor.setSpeed(_rotateCommandSpeed);
         motor.runSpeed();
     }
+}
+
+void ChassisControl::resetYawStability()
+{
+    _stableSamples = 0;
+    _stableSinceMs = 0;
+    _lastEvaluatedImuSequence = _imuSequence;
+    _rotateCommandSpeed = 0.0F;
+    _rotateFilteredYawRate = 0.0F;
+    _rotateLastYawDeg = _yawDeg;
+    _rotateLastYawMs = _lastImuMs;
+    _rotateLastImuSequence = _imuSequence;
+    _rotateLastControlUs = micros();
 }
 
 void ChassisControl::setFault(const char *message)
@@ -529,16 +799,69 @@ bool ChassisControl::allMotorsStopped()
 
 float ChassisControl::wrap180(float angleDeg)
 {
-    while (angleDeg > 180.0f)
-        angleDeg -= 360.0f;
-    while (angleDeg < -180.0f)
+    if (!isfinite(angleDeg))
+        return 0.0f;
+
+    angleDeg = fmodf(angleDeg + 180.0f, 360.0f);
+    if (angleDeg < 0.0f)
         angleDeg += 360.0f;
-    return angleDeg;
+    return angleDeg - 180.0f;
 }
 
 float ChassisControl::rpmToStepsPerSecond(float rpm)
 {
     return rpm * STEPS_PER_REV / 60.0f;
+}
+
+float ChassisControl::distanceScale(
+    float distance,
+    float positiveScale,
+    float negativeScale)
+{
+    return distance >= 0.0f ? positiveScale : negativeScale;
+}
+
+uint32_t ChassisControl::estimateTranslationTimeoutMs(
+    long maximumPulses,
+    float maximumSpeed,
+    float maximumAcceleration)
+{
+    const float distance = static_cast<float>(labs(maximumPulses));
+    const float accelerationDistance =
+        maximumSpeed * maximumSpeed / maximumAcceleration;
+
+    float theoreticalSeconds = 0.0f;
+    if (distance <= accelerationDistance)
+    {
+        theoreticalSeconds =
+            2.0f * sqrtf(distance / maximumAcceleration);
+    }
+    else
+    {
+        theoreticalSeconds =
+            2.0f * maximumSpeed / maximumAcceleration +
+            (distance - accelerationDistance) / maximumSpeed;
+    }
+
+    const float estimatedMs =
+        theoreticalSeconds * 1000.0f * MOTION_TIMEOUT_SCALE +
+        static_cast<float>(MOTION_TIMEOUT_MARGIN_MS);
+    return static_cast<uint32_t>(constrain(
+        estimatedMs,
+        static_cast<float>(MOTION_TIMEOUT_MIN_MS),
+        static_cast<float>(MOTION_TIMEOUT_MAX_MS)));
+}
+
+uint32_t ChassisControl::estimateRotationTimeoutMs(
+    float absoluteErrorDeg)
+{
+    const float estimatedMs =
+        static_cast<float>(ROTATION_TIMEOUT_BASE_MS) +
+        absoluteErrorDeg * ROTATION_TIMEOUT_PER_DEG_MS;
+    return static_cast<uint32_t>(constrain(
+        estimatedMs,
+        static_cast<float>(MOTION_TIMEOUT_MIN_MS),
+        static_cast<float>(MOTION_TIMEOUT_MAX_MS)));
 }
 
 void ChassisControl::bodyToWorld(

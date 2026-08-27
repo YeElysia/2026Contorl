@@ -145,6 +145,11 @@ void StartupDiagnostics::printSnapshot(const char *reason)
     _serial.print("/n");
     _serial.print(alignment.stableFrames);
     _serial.print(alignment.movePending ? "/MOVE" : "/WAIT");
+    if (alignment.worldPoseCorrected)
+    {
+        _serial.print("/FIX");
+        _serial.print(lroundf(alignment.worldCorrectionMm));
+    }
     printGraspState(grasp);
     _serial.print(" fault=");
 
@@ -164,13 +169,22 @@ void StartupDiagnostics::printGraspState(
     const MechanismTaskExecutor::GraspDebugState &state)
 {
     _serial.print(" grasp=");
-    if (!state.tracking && !state.hasObservation)
+    if (!state.tracking &&
+        !state.hasObservation &&
+        state.attempt == 0 &&
+        state.collectedMask == 0 &&
+        state.missedMask == 0)
     {
         _serial.print("-");
         return;
     }
 
     _serial.print(state.item);
+    _serial.print("/a");
+    _serial.print(state.attempt);
+    _serial.print("/r");
+    // 保留调试字段位置，下降后的视觉重确认已移除，恒为0。
+    _serial.print(0);
     _serial.print("/");
     if (state.hasObservation)
     {
@@ -188,8 +202,14 @@ void StartupDiagnostics::printGraspState(
     }
     _serial.print("/f");
     _serial.print(lroundf(state.forwardOffsetMm));
+    _serial.print("/r");
+    _serial.print(lroundf(state.rightOffsetMm));
     _serial.print("/e");
     _serial.print(lroundf(state.extensionTarget));
+    _serial.print("/ok");
+    _serial.print(state.collectedMask, HEX);
+    _serial.print("/miss");
+    _serial.print(state.missedMask, HEX);
     _serial.print(state.tracking ? "/RUN" : "/STOP");
 }
 
@@ -261,6 +281,8 @@ const char *StartupDiagnostics::chassisStateName(
         return "MOVE";
     case ChassisControl::State::Rotating:
         return "ROTATE";
+    case ChassisControl::State::Stopping:
+        return "STOP";
     case ChassisControl::State::Fault:
         return "FAULT";
     }
