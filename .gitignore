@@ -1,3 +1,5 @@
 .pio/
 .vscode/
 .DS_Store
+.codex_tmp/
+个人报告_*.docx
