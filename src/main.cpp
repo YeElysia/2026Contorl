@@ -8,6 +8,7 @@
 #include "MissionController.h"
 #include "MaixProGraspVision.h"
 #include "MaixProRingAlignment.h"
+#include "MaixVisionService.h"
 #include "MechanismTaskExecutor.h"
 #include "NextionMissionDisplay.h"
 #include "QRCodeMissionProvider.h"
@@ -59,8 +60,9 @@ namespace
         mission_config::QR_BAUD,
         mission_config::QR_TIMEOUT_MS);
     maixcam::MaixCamV2 camera(serialVision);
-    MaixProGraspVision graspVision(camera);
-    MaixProRingAlignment alignment(camera, graspVision, alignmentChassis);
+    maixcam::MaixVisionService vision(camera);
+    MaixProGraspVision graspVision(vision);
+    MaixProRingAlignment alignment(vision, alignmentChassis);
     MechanismTaskExecutor stationTask(
         serialMechanismStepper,
         serialMechanismBase,
@@ -170,7 +172,7 @@ void setup()
               field_config::START_YAW_DEG);
 
     LOG_INFO("Init", "Initializing vision camera...");
-    camera.begin(vision_config::BAUD);
+    vision.begin(vision_config::BAUD);
     
     LOG_INFO("Init", "Initializing QR code scanner...");
     missionData.begin();
@@ -206,6 +208,7 @@ void loop()
 
     startButton.tick();
     chassis.update();
+    vision.update();
 
     static bool beforeMissionReported = false;
     if (!beforeMissionReported)

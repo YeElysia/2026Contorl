@@ -14,6 +14,12 @@ namespace vision_config
     constexpr uint32_t TX_PIN = PE8;
     constexpr uint32_t BAUD = 115200;
 
+    // 命令帧可能与相机检测帧交错损坏，未收到对应SEQ的ACK即重发。
+    constexpr uint32_t COMMAND_RETRY_MS = 200;
+    constexpr uint8_t COMMAND_MAX_ATTEMPTS = 4;
+    // 圆环跟踪器只在经过IDLE时清空，RESET应答后等主循环跑过几帧。
+    constexpr uint32_t RESET_SETTLE_MS = 150;
+
     constexpr int16_t TARGET_DX_PX = 10;
     constexpr int16_t TARGET_DY_PX = 1;
     // 原料抓取允许更大的进入下降窗口。

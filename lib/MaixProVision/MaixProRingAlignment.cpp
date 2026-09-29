@@ -6,11 +6,9 @@
 #include <math.h>
 
 MaixProRingAlignment::MaixProRingAlignment(
-    maixcam::MaixCamV2 &camera,
-    IGraspVisionProvider &graspVision,
+    maixcam::MaixVisionService &vision,
     ChassisMotionPort &chassis)
-    : _camera(camera),
-      _graspVision(graspVision),
+    : _vision(vision),
       _chassis(chassis)
 {
 }
@@ -28,7 +26,6 @@ bool MaixProRingAlignment::start(
     // 原料区由机械臂逐物料视觉对准，不执行额外整车对准。
     if (request.station == Station::Material)
     {
-        _useGraspVision = false;
         _targetMode = maixcam::MODE_IDLE;
         _targetSelector = 0;
         _debug = {};
@@ -38,14 +35,12 @@ bool MaixProRingAlignment::start(
 
     if (request.station == Station::RoughProcessing)
     {
-        _useGraspVision = false;
         _targetMode = maixcam::MODE_RING;
         _targetSelector = vision_config::ROUGH_RING_ID;
     }
     else if (request.station == Station::Storage &&
              request.round == 0)
     {
-        _useGraspVision = false;
         _targetMode = maixcam::MODE_RING;
         _targetSelector =
             vision_config::STORAGE_REFERENCE_RING_ID;
@@ -57,7 +52,6 @@ bool MaixProRingAlignment::start(
              request.referenceColor <=
                  static_cast<uint8_t>(MaterialColor::Green))
     {
-        _useGraspVision = true;
         _allowRingFallback = true;
         _targetMode = maixcam::MODE_GRAB;
         _targetSelector = request.referenceColor;
@@ -82,18 +76,7 @@ bool MaixProRingAlignment::start(
     _debug.targetMode = _targetMode;
     _debug.targetSelector = _targetSelector;
     _result = AsyncResult::Running;
-    if (_useGraspVision)
-    {
-        if (!_graspVision.startTracking(_targetSelector))
-        {
-            _result = AsyncResult::Idle;
-            return false;
-        }
-    }
-    else
-    {
-        _camera.setTarget(_targetMode, _targetSelector);
-    }
+    requestVision();
     return true;
 }
 
@@ -105,34 +88,13 @@ void MaixProRingAlignment::update()
     if (_result != AsyncResult::Running)
         return;
 
-    if (_useGraspVision)
+    const maixcam::MaixVisionService::Status visionStatus =
+        _vision.status(_visionToken);
+    if (visionStatus != maixcam::MaixVisionService::Status::Pending &&
+        visionStatus != maixcam::MaixVisionService::Status::Active)
     {
-        _graspVision.update();
-        if (_graspVision.faulted())
-        {
-            fail();
-            return;
-        }
-    }
-    else
-    {
-        _camera.poll();
-
-        uint8_t command = 0;
-        uint8_t commandResult = 0;
-        uint8_t mode = 0;
-        uint8_t selector = 0;
-        if (_camera.takeAck(
-                command,
-                commandResult,
-                mode,
-                selector) &&
-            command == maixcam::CMD_SET_TARGET &&
-            commandResult != 0)
-        {
-            fail();
-            return;
-        }
+        fail();
+        return;
     }
 
     const uint32_t now = millis();
@@ -153,17 +115,9 @@ void MaixProRingAlignment::update()
         if (_chassis.busy())
             return;
 
-        // 清除运动期间缓存的最后一帧，下一轮只接受停车后的新图像。
-        if (_useGraspVision)
-        {
-            GraspObservation staleObservation;
-            _graspVision.takeObservation(staleObservation);
-        }
-        else
-        {
-            maixcam::Detection staleDetection;
-            _camera.takeDetection(staleDetection);
-        }
+        // 跳过运动期间的最后一帧，下一轮只接受停车后的新图像。
+        maixcam::MaixVisionService::Observation stale;
+        _vision.readNew(_visionToken, _visionCursor, stale);
         _movePending = false;
         _debug.movePending = false;
         _debug.hasObservation = false;
@@ -174,26 +128,10 @@ void MaixProRingAlignment::update()
         return;
     }
 
-    maixcam::Detection detection;
-    bool hasDetection = false;
-    if (_useGraspVision)
-    {
-        GraspObservation observation;
-        if (_graspVision.takeObservation(observation))
-        {
-            detection.mode = maixcam::MODE_GRAB;
-            detection.targetId = _targetSelector;
-            detection.found = observation.found;
-            detection.dx = observation.dx;
-            detection.dy = observation.dy;
-            detection.quality = observation.quality;
-            hasDetection = true;
-        }
-    }
-    else
-    {
-        hasDetection = _camera.takeDetection(detection);
-    }
+    maixcam::MaixVisionService::Observation frame;
+    const bool hasDetection =
+        _vision.readNew(_visionToken, _visionCursor, frame);
+    const maixcam::Detection &detection = frame.detection;
 
     if (!hasDetection)
     {
@@ -353,22 +291,22 @@ void MaixProRingAlignment::fail()
     _result = AsyncResult::Failed;
 }
 
+void MaixProRingAlignment::requestVision()
+{
+    _visionToken = _vision.request(_targetMode, _targetSelector);
+    _visionCursor = 0;
+}
+
 void MaixProRingAlignment::stopVision()
 {
-    if (_useGraspVision)
-        _graspVision.stop();
-    else
-        _camera.reset();
+    _vision.release(_visionToken);
+    _visionToken = 0;
 }
 
 void MaixProRingAlignment::activateStorageRingFallback()
 {
     using namespace vision_config;
 
-    if (_useGraspVision)
-        _graspVision.stop();
-
-    _useGraspVision = false;
     _ringFallbackActive = true;
     _targetMode = maixcam::MODE_RING;
     _targetSelector = STORAGE_REFERENCE_RING_ID;
@@ -380,7 +318,7 @@ void MaixProRingAlignment::activateStorageRingFallback()
     _debug.stableFrames = 0;
     _debug.targetMode = _targetMode;
     _debug.targetSelector = _targetSelector;
-    _camera.setTarget(_targetMode, _targetSelector);
+    requestVision();
 }
 
 bool MaixProRingAlignment::correctWorldPositionFromLandmark()

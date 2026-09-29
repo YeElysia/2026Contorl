@@ -1,8 +1,7 @@
 #pragma once
 
 #include "ChassisMotionPort.h"
-#include "GraspVisionPorts.h"
-#include "MaixCamV2.h"
+#include "MaixVisionService.h"
 #include "MissionPorts.h"
 
 /**
@@ -37,8 +36,7 @@ public:
     };
 
     MaixProRingAlignment(
-        maixcam::MaixCamV2 &camera,
-        IGraspVisionProvider &graspVision,
+        maixcam::MaixVisionService &vision,
         ChassisMotionPort &chassis);
 
     bool start(const AlignmentRequest &request) override;
@@ -48,12 +46,12 @@ public:
     const DebugState &debugState() const;
 
 private:
-    maixcam::MaixCamV2 &_camera;
-    IGraspVisionProvider &_graspVision;
+    maixcam::MaixVisionService &_vision;
     ChassisMotionPort &_chassis;
+    maixcam::MaixVisionService::Token _visionToken = 0;
+    uint32_t _visionCursor = 0;
 
     AsyncResult _result = AsyncResult::Idle;
-    bool _useGraspVision = false;
     bool _movePending = false;
     bool _allowRingFallback = false;
     bool _ringFallbackActive = false;
@@ -66,6 +64,7 @@ private:
     Station _station = Station::Material;
     DebugState _debug;
 
+    void requestVision();
     void stopVision();
     void fail();
     void activateStorageRingFallback();

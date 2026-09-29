@@ -3,10 +3,12 @@
 
 #include "ChassisControl.h"
 #include "ChassisMotionPort.h"
+#include "DebugLog.h"
 #include "GraspMotionPorts.h"
 #include "GraspVisionPorts.h"
 #include "MaixCamV2.h"
 #include "MaixProRingAlignment.h"
+#include "MaixVisionService.h"
 #include "MechanismTaskExecutor.h"
 #include "MissionRoutes.h"
 #include "chassis_config.h"
@@ -75,11 +77,9 @@ HardwareSerial serialDebug(
 ChassisControl chassis(&serialImu);
 ChassisMotionPort alignmentChassis(chassis, ChassisOwner::Alignment);
 maixcam::MaixCamV2 camera(serialVision);
+maixcam::MaixVisionService vision(camera);
 IdleGraspVision idleGraspVision;
-MaixProRingAlignment alignment(
-    camera,
-    idleGraspVision,
-    alignmentChassis);
+MaixProRingAlignment alignment(vision, alignmentChassis);
 IdleForwardPositioner idleForwardPositioner;
 MechanismTaskExecutor mechanism(
     serialMechanismStepper,
@@ -275,7 +275,8 @@ void setup()
     pinMode(mission_config::STATUS_LED_PIN, OUTPUT);
     digitalWrite(mission_config::STATUS_LED_PIN, LOW);
 
-    serialDebug.begin(debug_config::BAUD);
+    // 通过DebugLog输出视觉服务的REQUEST/ACTIVE/RETRY日志。
+    DebugLog::begin(&serialDebug, debug_config::BAUD, DebugLog::Level::INFO);
     serialDebug.println("RING boot");
 
     startButton.reset();
@@ -286,7 +287,7 @@ void setup()
         mission_routes::ROUGH_ANCHOR.position.xMm,
         mission_routes::ROUGH_ANCHOR.position.yMm,
         mission_routes::ROUGH_ANCHOR.yawDeg);
-    camera.begin(vision_config::BAUD);
+    vision.begin(vision_config::BAUD);
     mechanism.begin();
 }
 
@@ -294,6 +295,7 @@ void loop()
 {
     startButton.tick();
     chassis.update();
+    vision.update();
     mechanism.update();
     alignment.update();
     updateSequence();

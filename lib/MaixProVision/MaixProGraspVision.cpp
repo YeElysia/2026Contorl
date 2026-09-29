@@ -1,20 +1,14 @@
 #include "MaixProGraspVision.h"
 
-#include "vision_config.h"
-
 MaixProGraspVision::MaixProGraspVision(
-    maixcam::MaixCamV2 &camera)
-    : _camera(camera)
+    maixcam::MaixVisionService &vision)
+    : _vision(vision)
 {
 }
 
 void MaixProGraspVision::begin()
 {
-    _begun = true;
-    _camera.reset();
-    _active = false;
-    _faulted = false;
-    _observationReady = false;
+    stop();
 }
 
 bool MaixProGraspVision::startTracking(uint8_t color)
@@ -24,46 +18,25 @@ bool MaixProGraspVision::startTracking(uint8_t color)
 
     _targetColor = color;
     _observationReady = false;
-    _faulted = false;
-    _active = true;
-    _camera.setTarget(maixcam::MODE_GRAB, color);
+    _token = _vision.request(maixcam::MODE_GRAB, color);
     return true;
 }
 
 void MaixProGraspVision::update()
 {
-    // 未执行抓取时不读取共享相机，避免消费圆环对准器的应答和图像。
-    if (!_active)
+    maixcam::MaixVisionService::Observation frame;
+    if (!_vision.readNew(_token, _cursor, frame))
         return;
 
-    _camera.poll();
-
-    uint8_t command = 0;
-    uint8_t result = 0;
-    uint8_t mode = 0;
-    uint8_t selector = 0;
-    if (_camera.takeAck(command, result, mode, selector) &&
-        command == maixcam::CMD_SET_TARGET &&
-        result != 0)
-    {
-        _faulted = true;
-    }
-
-    maixcam::Detection detection;
-    if (!_camera.takeDetection(detection))
+    // 目标丢失帧的targetId为0，与原逻辑一致只保留本颜色的命中帧。
+    if (frame.detection.targetId != _targetColor)
         return;
 
-    if (detection.mode != maixcam::MODE_GRAB ||
-        detection.targetId != _targetColor)
-    {
-        return;
-    }
-
-    _observation.found = detection.found;
-    _observation.dx = detection.dx;
-    _observation.dy = detection.dy;
-    _observation.quality = detection.quality;
-    _observation.receivedMs = millis();
+    _observation.found = frame.detection.found;
+    _observation.dx = frame.detection.dx;
+    _observation.dy = frame.detection.dy;
+    _observation.quality = frame.detection.quality;
+    _observation.receivedMs = frame.receivedMs;
     _observationReady = true;
 }
 
@@ -80,13 +53,19 @@ bool MaixProGraspVision::takeObservation(
 
 void MaixProGraspVision::stop()
 {
-    _active = false;
+    _vision.release(_token);
+    _token = 0;
     _observationReady = false;
-    if (_begun)
-        _camera.reset();
 }
 
 bool MaixProGraspVision::faulted() const
 {
-    return _faulted;
+    if (_token == 0)
+        return false;
+
+    const maixcam::MaixVisionService::Status status =
+        _vision.status(_token);
+    return status == maixcam::MaixVisionService::Status::Rejected ||
+           status == maixcam::MaixVisionService::Status::Failed ||
+           status == maixcam::MaixVisionService::Status::Released;
 }
