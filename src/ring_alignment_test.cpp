@@ -2,6 +2,7 @@
 #include <OneButton.h>
 
 #include "ChassisControl.h"
+#include "ChassisMotionPort.h"
 #include "GraspMotionPorts.h"
 #include "GraspVisionPorts.h"
 #include "MaixCamV2.h"
@@ -40,6 +41,7 @@ public:
     bool busy() const override { return false; }
     bool faulted() const override { return false; }
     void stop() override {}
+    void release() override {}
 };
 
 enum class TestState : uint8_t
@@ -71,12 +73,13 @@ HardwareSerial serialDebug(
     debug_config::TX_PIN);
 
 ChassisControl chassis(&serialImu);
+ChassisMotionPort alignmentChassis(chassis, ChassisOwner::Alignment);
 maixcam::MaixCamV2 camera(serialVision);
 IdleGraspVision idleGraspVision;
 MaixProRingAlignment alignment(
     camera,
     idleGraspVision,
-    chassis);
+    alignmentChassis);
 IdleForwardPositioner idleForwardPositioner;
 MechanismTaskExecutor mechanism(
     serialMechanismStepper,

@@ -29,6 +29,7 @@ public:
     bool busy() const override { return false; }
     bool faulted() const override { return false; }
     void stop() override {}
+    void release() override {}
 };
 
 HardwareSerial serialStepper(

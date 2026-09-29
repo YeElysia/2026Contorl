@@ -93,8 +93,8 @@ namespace vision_config
      * 不能把机械硬限位直接当作软件目标。
      */
     /*
-     * 原料区路线基准保持在x=1200。
-     * 完成后仍由状态机回到路线基准，不影响后续固定坐标移动。
+     * 原料区路线基准保持在x=1200，偏移相对该基准限幅。
+     * 完成后不退回基准，下一段路线按世界坐标从当前位置出发。
      */
     constexpr float PICKUP_FORWARD_MIN_OFFSET_MM = -100.0F;
     constexpr float PICKUP_FORWARD_MAX_OFFSET_MM = 100.0F;

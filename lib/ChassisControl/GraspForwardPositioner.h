@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ChassisControl.h"
+#include "ChassisMotionPort.h"
 #include "GraspMotionPorts.h"
 
 /**
@@ -9,7 +9,7 @@
 class GraspForwardPositioner : public IGraspForwardPositioner
 {
 public:
-    explicit GraspForwardPositioner(ChassisControl &chassis);
+    explicit GraspForwardPositioner(ChassisMotionPort &chassis);
 
     bool moveBodyRelative(
         float forwardMm,
@@ -17,7 +17,8 @@ public:
     bool busy() const override;
     bool faulted() const override;
     void stop() override;
+    void release() override;
 
 private:
-    ChassisControl &_chassis;
+    ChassisMotionPort &_chassis;
 };

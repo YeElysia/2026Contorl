@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 
-#include "ChassisControl.h"
+#include "ChassisMotionPort.h"
 #include "MissionPorts.h"
 
 enum class RouteActionType : uint8_t
@@ -79,13 +79,14 @@ constexpr RouteAction routeRotateTo(float yawDeg)
 /**
  * @brief 非阻塞底盘路线执行器。
  *
- * 每次只向ChassisControl下发一个动作，确认底盘空闲后才进入下一步。
+ * 每次只向底盘下发一个动作，确认底盘空闲后才进入下一步。
+ * 路线结束、失败或取消时释放底盘所有权。
  * 它不知道任务区、二维码或机械臂，只负责可靠执行一段路线。
  */
 class RouteExecutor
 {
 public:
-    explicit RouteExecutor(ChassisControl &chassis);
+    explicit RouteExecutor(ChassisMotionPort &chassis);
 
     bool start(RouteDefinition route);
     void update();
@@ -95,9 +96,11 @@ public:
     const char *faultMessage() const;
 
 private:
-    ChassisControl &_chassis;
+    ChassisMotionPort &_chassis;
     const RouteAction *_actions = nullptr;
     size_t _count = 0;
     size_t _index = 0;
     AsyncResult _result = AsyncResult::Idle;
+
+    void finish(AsyncResult result);
 };

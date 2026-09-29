@@ -16,4 +16,6 @@ public:
     virtual bool busy() const = 0;
     virtual bool faulted() const = 0;
     virtual void stop() = 0;
+    // 本工位任务结束（成功、失败或取消）后交还底盘。
+    virtual void release() = 0;
 };

@@ -3,7 +3,7 @@
 #include "chassis_config.h"
 
 GraspForwardPositioner::GraspForwardPositioner(
-    ChassisControl &chassis)
+    ChassisMotionPort &chassis)
     : _chassis(chassis)
 {
 }
@@ -26,11 +26,15 @@ bool GraspForwardPositioner::busy() const
 
 bool GraspForwardPositioner::faulted() const
 {
-    return _chassis.state() == ChassisControl::State::Fault;
+    return _chassis.faulted();
 }
 
 void GraspForwardPositioner::stop()
 {
-    if (_chassis.busy())
-        _chassis.stop();
+    _chassis.stop();
+}
+
+void GraspForwardPositioner::release()
+{
+    _chassis.release();
 }

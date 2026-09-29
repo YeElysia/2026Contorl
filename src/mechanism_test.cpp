@@ -113,6 +113,7 @@ public:
     }
 
     void stop() override {}
+    void release() override {}
 };
 
 enum class TestStage : uint8_t

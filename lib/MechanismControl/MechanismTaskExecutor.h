@@ -136,7 +136,6 @@ private:
         CollectGrasping,
         CollectDepositing,
         CollectSkipping,
-        CollectReturningToRoute,
         RoughPlacing,
         RoughRetrieving,
         FinalStoring,
@@ -280,8 +279,6 @@ private:
     bool currentItemAvailable() const;
     bool hasAvailableItemAfterCurrent() const;
     uint8_t currentStorageStackLevel() const;
-    void startReturnToMaterialRouteAnchor();
-    void updateReturnToMaterialRouteAnchor();
     bool updateStepperStep(
         TTL_Stepper &motor,
         ActionStep &step,

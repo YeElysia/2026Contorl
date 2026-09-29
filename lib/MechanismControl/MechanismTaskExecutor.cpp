@@ -168,8 +168,6 @@ const char *MechanismTaskExecutor::debugPhase() const
         return "COLLECT_DEPOSIT";
     case TaskPhase::CollectSkipping:
         return "COLLECT_SKIP";
-    case TaskPhase::CollectReturningToRoute:
-        return "COLLECT_RETURN";
     case TaskPhase::RoughPlacing:
         return "ROUGH_PLACE";
     case TaskPhase::RoughRetrieving:
@@ -478,12 +476,6 @@ void MechanismTaskExecutor::update()
         return;
     }
 
-    if (_phase == TaskPhase::CollectReturningToRoute)
-    {
-        updateReturnToMaterialRouteAnchor();
-        return;
-    }
-
     if ((_phase == TaskPhase::CollectPreparing ||
          _phase == TaskPhase::CollectDepositing ||
          _phase == TaskPhase::CollectSkipping) &&
@@ -515,6 +507,8 @@ void MechanismTaskExecutor::cancel()
         _stepperProtocol.Emm_V5_Stop_Now(EXTENSION_STEPPER_ID, false);
         _baseProtocol.Emm_V5_Stop_Now(BASE_STEPPER_ID, false);
     }
+
+    _forwardPositioner.release();
 
     clearAction();
     _forwardCommandActive = false;
@@ -1358,7 +1352,13 @@ void MechanismTaskExecutor::advanceAfterPickup()
         return;
     }
 
-    startReturnToMaterialRouteAnchor();
+    /*
+     * 不再把底盘退回原料区基准点：视觉微调的位移已计入里程计，
+     * 下一段路线按世界坐标直接从当前位置出发。
+     */
+    _graspVision.stop();
+    _primedItemIndex = -1;
+    finishStationTask();
 }
 
 bool MechanismTaskExecutor::selectFirstAvailableItem()
@@ -1427,50 +1427,6 @@ uint8_t MechanismTaskExecutor::currentStorageStackLevel() const
 
     // 第一轮对应位置没有物料时，第二轮自动按第一层高度放置。
     return 0;
-}
-
-void MechanismTaskExecutor::startReturnToMaterialRouteAnchor()
-{
-    _graspVision.stop();
-    _primedItemIndex = -1;
-    clearAction();
-
-    if (fabsf(_alignmentForwardOffset) <= 0.1F &&
-        fabsf(_alignmentRightOffset) <= 0.1F)
-    {
-        _alignmentForwardOffset = 0.0F;
-        _alignmentRightOffset = 0.0F;
-        finishStationTask();
-        return;
-    }
-
-    if (!_forwardPositioner.moveBodyRelative(
-            -_alignmentForwardOffset,
-            -_alignmentRightOffset))
-    {
-        fail("failed to return material route anchor");
-        return;
-    }
-
-    _forwardCommandActive = true;
-    _phase = TaskPhase::CollectReturningToRoute;
-}
-
-void MechanismTaskExecutor::updateReturnToMaterialRouteAnchor()
-{
-    if (_forwardPositioner.faulted())
-    {
-        fail("material route-anchor return failed");
-        return;
-    }
-
-    if (_forwardPositioner.busy())
-        return;
-
-    _forwardCommandActive = false;
-    _alignmentForwardOffset = 0.0F;
-    _alignmentRightOffset = 0.0F;
-    finishStationTask();
 }
 
 void MechanismTaskExecutor::loadStorageToRingAction(
@@ -2167,10 +2123,6 @@ void MechanismTaskExecutor::onActionCompleted()
         fail("unexpected grasp alignment completion");
         break;
 
-    case TaskPhase::CollectReturningToRoute:
-        fail("unexpected route-anchor action completion");
-        break;
-
     case TaskPhase::RoughPlacing:
         if (selectNextAvailableItem())
         {
@@ -2258,6 +2210,7 @@ void MechanismTaskExecutor::finishStationTask()
      * 此时即可通知底盘启程；完整收纳由prepareForTravel()在行驶
      * 期间完成，避免停车等待底座和载物盘回位。
      */
+    _forwardPositioner.release();
     _phase = TaskPhase::Idle;
     _result = AsyncResult::Succeeded;
     clearAction();
@@ -2312,6 +2265,8 @@ void MechanismTaskExecutor::fail(const char *message)
     _stepperProtocol.Emm_V5_Stop_Now(LIFT_STEPPER_ID, false);
     _stepperProtocol.Emm_V5_Stop_Now(EXTENSION_STEPPER_ID, false);
     _baseProtocol.Emm_V5_Stop_Now(BASE_STEPPER_ID, false);
+
+    _forwardPositioner.release();
 
     _fault = message;
     _forwardCommandActive = false;

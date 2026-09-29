@@ -431,6 +431,54 @@ const char *ChassisControl::faultMessage() const
     return _fault;
 }
 
+const char *chassisOwnerName(ChassisOwner owner)
+{
+    switch (owner)
+    {
+    case ChassisOwner::None:
+        return "none";
+    case ChassisOwner::Route:
+        return "route";
+    case ChassisOwner::Alignment:
+        return "alignment";
+    case ChassisOwner::Grasp:
+        return "grasp";
+    }
+    return "unknown";
+}
+
+bool ChassisControl::acquire(ChassisOwner owner)
+{
+    if (owner == ChassisOwner::None)
+        return false;
+    if (_owner == owner)
+        return true;
+    if (_owner != ChassisOwner::None)
+    {
+        LOGF_ERROR("Chassis", "OWNER_DENIED request=%s owner=%s",
+                   chassisOwnerName(owner), chassisOwnerName(_owner));
+        return false;
+    }
+
+    _owner = owner;
+    LOGF_DEBUG("Chassis", "OWNER_ACQUIRE %s", chassisOwnerName(owner));
+    return true;
+}
+
+void ChassisControl::release(ChassisOwner owner)
+{
+    if (owner == ChassisOwner::None || _owner != owner)
+        return;
+
+    _owner = ChassisOwner::None;
+    LOGF_DEBUG("Chassis", "OWNER_RELEASE %s", chassisOwnerName(owner));
+}
+
+ChassisOwner ChassisControl::owner() const
+{
+    return _owner;
+}
+
 bool ChassisControl::updateImu()
 {
     if (_imuSerial == nullptr)

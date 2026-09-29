@@ -5,6 +5,22 @@
 
 class ChassisEmm42TtlFeedback;
 
+/**
+ * @brief 当前允许下发底盘运动的模块。
+ *
+ * 同一时刻只有一个模块拥有底盘；其他模块经ChassisMotionPort下发
+ * 的命令会被拒绝，避免路线、对准和抓取微调互相覆盖。
+ */
+enum class ChassisOwner : uint8_t
+{
+    None,
+    Route,
+    Alignment,
+    Grasp
+};
+
+const char *chassisOwnerName(ChassisOwner owner);
+
 class ChassisControl
 {
 public:
@@ -132,6 +148,12 @@ public:
     bool correctWorldPosition(float worldXmm, float worldYmm);
     const char *faultMessage() const;
 
+    // 未被占用或已由owner占用时返回true。
+    bool acquire(ChassisOwner owner);
+    // 只有当前拥有者才能释放。
+    void release(ChassisOwner owner);
+    ChassisOwner owner() const;
+
     static void bodyToWorld(
         float forwardMm,
         float rightMm,
@@ -157,6 +179,7 @@ private:
     ChassisStepperDriver _driver;
 
     State _state = State::Idle;
+    ChassisOwner _owner = ChassisOwner::None;
     char _fault[80] = {};
 
     uint8_t _imuFrame[11] = {};

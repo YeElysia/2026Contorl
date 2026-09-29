@@ -2,6 +2,7 @@
 #include <OneButton.h>
 
 #include "ChassisControl.h"
+#include "ChassisMotionPort.h"
 #include "DebugLog.h"
 #include "GraspForwardPositioner.h"
 #include "MissionController.h"
@@ -47,8 +48,11 @@ namespace
         debug_config::TX_PIN);
 
     ChassisControl chassis(&serialImu);
-    GraspForwardPositioner graspForwardPositioner(chassis);
-    RouteExecutor routeExecutor(chassis);
+    ChassisMotionPort routeChassis(chassis, ChassisOwner::Route);
+    ChassisMotionPort alignmentChassis(chassis, ChassisOwner::Alignment);
+    ChassisMotionPort graspChassis(chassis, ChassisOwner::Grasp);
+    GraspForwardPositioner graspForwardPositioner(graspChassis);
+    RouteExecutor routeExecutor(routeChassis);
 
     QRCodeMissionProvider missionData(
         serialQr,
@@ -56,7 +60,7 @@ namespace
         mission_config::QR_TIMEOUT_MS);
     maixcam::MaixCamV2 camera(serialVision);
     MaixProGraspVision graspVision(camera);
-    MaixProRingAlignment alignment(camera, graspVision, chassis);
+    MaixProRingAlignment alignment(camera, graspVision, alignmentChassis);
     MechanismTaskExecutor stationTask(
         serialMechanismStepper,
         serialMechanismBase,

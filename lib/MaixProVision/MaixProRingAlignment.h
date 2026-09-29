@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ChassisControl.h"
+#include "ChassisMotionPort.h"
 #include "GraspVisionPorts.h"
 #include "MaixCamV2.h"
 #include "MissionPorts.h"
@@ -39,7 +39,7 @@ public:
     MaixProRingAlignment(
         maixcam::MaixCamV2 &camera,
         IGraspVisionProvider &graspVision,
-        ChassisControl &chassis);
+        ChassisMotionPort &chassis);
 
     bool start(const AlignmentRequest &request) override;
     void update() override;
@@ -50,7 +50,7 @@ public:
 private:
     maixcam::MaixCamV2 &_camera;
     IGraspVisionProvider &_graspVision;
-    ChassisControl &_chassis;
+    ChassisMotionPort &_chassis;
 
     AsyncResult _result = AsyncResult::Idle;
     bool _useGraspVision = false;

@@ -2,7 +2,7 @@
 
 #include "chassis_config.h"
 
-RouteExecutor::RouteExecutor(ChassisControl &chassis)
+RouteExecutor::RouteExecutor(ChassisMotionPort &chassis)
     : _chassis(chassis)
 {
 }
@@ -11,7 +11,7 @@ bool RouteExecutor::start(RouteDefinition route)
 {
     if (_result == AsyncResult::Running ||
         _chassis.busy() ||
-        _chassis.state() == ChassisControl::State::Fault ||
+        _chassis.faulted() ||
         (route.actions == nullptr && route.count != 0))
     {
         return false;
@@ -32,9 +32,9 @@ void RouteExecutor::update()
     if (_result != AsyncResult::Running)
         return;
 
-    if (_chassis.state() == ChassisControl::State::Fault)
+    if (_chassis.faulted())
     {
-        _result = AsyncResult::Failed;
+        finish(AsyncResult::Failed);
         return;
     }
 
@@ -43,7 +43,7 @@ void RouteExecutor::update()
 
     if (_index >= _count)
     {
-        _result = AsyncResult::Succeeded;
+        finish(AsyncResult::Succeeded);
         return;
     }
 
@@ -81,13 +81,14 @@ void RouteExecutor::update()
     if (accepted)
         ++_index;
     else
-        _result = AsyncResult::Failed;
+        finish(AsyncResult::Failed);
 }
 
 void RouteExecutor::cancel()
 {
     if (_result == AsyncResult::Running)
         _chassis.stop();
+    _chassis.release();
 
     _actions = nullptr;
     _count = 0;
@@ -103,4 +104,10 @@ AsyncResult RouteExecutor::result() const
 const char *RouteExecutor::faultMessage() const
 {
     return _chassis.faultMessage();
+}
+
+void RouteExecutor::finish(AsyncResult result)
+{
+    _chassis.release();
+    _result = result;
 }

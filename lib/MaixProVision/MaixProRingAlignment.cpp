@@ -8,7 +8,7 @@
 MaixProRingAlignment::MaixProRingAlignment(
     maixcam::MaixCamV2 &camera,
     IGraspVisionProvider &graspVision,
-    ChassisControl &chassis)
+    ChassisMotionPort &chassis)
     : _camera(camera),
       _graspVision(graspVision),
       _chassis(chassis)
@@ -67,8 +67,7 @@ bool MaixProRingAlignment::start(
         return false;
     }
 
-    if (_chassis.busy() ||
-        _chassis.state() == ChassisControl::State::Fault)
+    if (_chassis.busy() || _chassis.faulted())
     {
         return false;
     }
@@ -143,7 +142,7 @@ void MaixProRingAlignment::update()
         return;
     }
 
-    if (_chassis.state() == ChassisControl::State::Fault)
+    if (_chassis.faulted())
     {
         fail();
         return;
@@ -281,6 +280,7 @@ void MaixProRingAlignment::update()
                 return;
             }
             stopVision();
+            _chassis.release();
             _result = AsyncResult::Succeeded;
         }
         return;
@@ -326,8 +326,9 @@ AsyncResult MaixProRingAlignment::result() const
 
 void MaixProRingAlignment::cancel()
 {
-    if (_result == AsyncResult::Running && _chassis.busy())
+    if (_result == AsyncResult::Running)
         _chassis.stop();
+    _chassis.release();
 
     stopVision();
     _movePending = false;
@@ -343,8 +344,8 @@ MaixProRingAlignment::debugState() const
 
 void MaixProRingAlignment::fail()
 {
-    if (_chassis.busy())
-        _chassis.stop();
+    _chassis.stop();
+    _chassis.release();
 
     stopVision();
     _movePending = false;
