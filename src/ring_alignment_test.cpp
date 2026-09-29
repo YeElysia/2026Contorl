@@ -139,6 +139,8 @@ void updateSequence()
     switch (state)
     {
     case TestState::WaitingForStart:
+    case TestState::Completed:
+    case TestState::Fault:
         if (!startRequested ||
             !mechanism.ready() ||
             mechanism.result() == AsyncResult::Running)
@@ -180,9 +182,6 @@ void updateSequence()
             enterFault("ring alignment failed");
         break;
 
-    case TestState::Completed:
-    case TestState::Fault:
-        break;
     }
 }
 
@@ -231,7 +230,19 @@ void printReport()
     serialDebug.print(" stable=");
     serialDebug.print(ring.stableFrames);
     serialDebug.print(" moving=");
-    serialDebug.println(ring.movePending ? 1 : 0);
+    serialDebug.print(ring.movePending ? 1 : 0);
+    serialDebug.print(" target=");
+    serialDebug.print(ring.targetMode, HEX);
+    serialDebug.print(":");
+    serialDebug.print(ring.targetSelector);
+    serialDebug.print(" last=");
+    serialDebug.print(ring.lastMode, HEX);
+    serialDebug.print(":");
+    serialDebug.print(ring.lastTargetId);
+    serialDebug.print(" obs=");
+    serialDebug.print(ring.observations);
+    serialDebug.print(" ign=");
+    serialDebug.println(ring.ignoredObservations);
 }
 
 void updateLed()

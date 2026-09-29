@@ -20,6 +20,17 @@ namespace chassis_config
     constexpr uint32_t IMU_TX_PIN = PD8;
     constexpr uint32_t IMU_BAUD = 115200;
 
+    // EMM42 V5 TTL反馈串口（所有底盘电机共用）
+    constexpr uint32_t MOTOR_TTL_RX_PIN = PA10;
+    constexpr uint32_t MOTOR_TTL_TX_PIN = PA9;
+    constexpr uint32_t MOTOR_TTL_BAUD = 115200;
+    /*
+     * 4个底盘电机的TTL地址，顺序：左前、右前、左后、右后。
+     * 若电机未设置地址或地址冲突，需通过EMM42配置工具修改。
+     * 地址必须唯一且非零，范围通常1-247。
+     */
+    constexpr uint8_t MOTOR_TTL_ADDRESSES[4] = {1, 2, 3, 4};
+
     // 机械参数。换轮或调整细分时只修改这里。
     constexpr float WHEEL_DIAMETER_MM = 100.0f;
     constexpr float MOTOR_STEP_ANGLE_DEG = 1.8f;
@@ -35,9 +46,9 @@ namespace chassis_config
      * 980mm，则对应方向填1.0204。前后、左右分开标定以补偿麦轮
      * 安装和地面摩擦带来的非对称误差。
      */
-    constexpr float FORWARD_DISTANCE_SCALE = 1.0f;
+    constexpr float FORWARD_DISTANCE_SCALE = 1.0f; // 1000.0f / 994.5f; 1.00553
     constexpr float BACKWARD_DISTANCE_SCALE = 1.0f;
-    constexpr float RIGHT_DISTANCE_SCALE = 1.0f;
+    constexpr float RIGHT_DISTANCE_SCALE = 1.0f; // 1000.0f / 983.0f; 1.01729
     constexpr float LEFT_DISTANCE_SCALE = 1.0f;
 
     // 电机正方向。若某个轮子反转，只修改对应项。

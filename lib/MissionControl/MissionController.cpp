@@ -2,6 +2,7 @@
 
 #include <string.h>
 
+#include "DebugLog.h"
 #include "MissionRoutes.h"
 
 using namespace mission_routes;
@@ -173,6 +174,7 @@ void MissionController::updateStartup()
 
     // 机械臂保持上电初始化位，运输收纳动作改在扫码区启动。
     _state = State::WaitingForStart;
+    LOG_INFO("Mission", "STATE: WaitingForStart");
 }
 
 void MissionController::updateWaitingForStart()
@@ -443,6 +445,7 @@ void MissionController::onRouteCompleted()
         _scanPlanReady = false;
         _missionData.start();
         _state = State::Scanning;
+        LOG_INFO("Mission", "STATE: Scanning");
         break;
 
     case State::MovingToMaterial:
@@ -477,6 +480,7 @@ void MissionController::onRouteCompleted()
         if (_stationTask.result() == AsyncResult::Running)
             return;
         _state = State::Finished;
+        LOGF_INFO("Mission", "STATE: Finished (Round %d Complete)", _round);
         break;
 
     default:
@@ -576,4 +580,6 @@ void MissionController::fail(const char *message)
     _stationTask.cancel();
     _faultMessage = message;
     _state = State::Fault;
+    
+    LOGF_ERROR("Mission", "MISSION_FAULT: %s", message);
 }

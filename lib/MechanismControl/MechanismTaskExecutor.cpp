@@ -1,5 +1,6 @@
 #include "MechanismTaskExecutor.h"
 
+#include "DebugLog.h"
 #include "mechanism_config.h"
 #include "vision_config.h"
 
@@ -28,15 +29,42 @@ MechanismTaskExecutor::MechanismTaskExecutor(
 
 void MechanismTaskExecutor::begin(uint8_t initialStorageSlot)
 {
+    LOG_INFO("Mechanism", "Starting mechanism initialization...");
+    
+    if (SKIP_MECHANISM_INIT)
+    {
+        LOG_WARNING("Mechanism", "⚠️  SKIP_MECHANISM_INIT enabled - bypassing hardware initialization");
+        LOG_WARNING("Mechanism", "Mechanism will report ready immediately without moving motors");
+        _initialized = true;
+        _result = AsyncResult::Succeeded;
+        _phase = TaskPhase::Idle;
+        _itemIndex = 0;
+        _collectedItemMask[0] = 0;
+        _collectedItemMask[1] = 0;
+        _missedItemMask[0] = 0;
+        _missedItemMask[1] = 0;
+        _primedItemIndex = -1;
+        _preparedStorageSlot = -1;
+        _pickupReferenceValid = false;
+        _pickupTargetSeen = false;
+        _fault = "";
+        return;
+    }
+    
     _initialStorageSlot =
         initialStorageSlot <= MATERIALS_PER_BATCH
             ? initialStorageSlot
             : 0;
+    
+    LOG_DEBUG("Mechanism", "Initializing grasp vision...");
     _graspVision.begin();
+    
+    LOG_DEBUG("Mechanism", "Initializing stepper protocols...");
     _stepperProtocol.init(&_stepperSerial, BUS_BAUD);
     _baseProtocol.init(&_baseSerial, BUS_BAUD);
     _servoProtocol.init(&_servoSerial, BUS_BAUD);
 
+    LOG_DEBUG("Mechanism", "Configuring lift stepper...");
     _lift.init(LIFT_STEPPER_ID, &_stepperProtocol);
     _lift.set(
         LIFT_SPEED,
@@ -44,6 +72,8 @@ void MechanismTaskExecutor::begin(uint8_t initialStorageSlot)
         LIFT_CW,
         LIFT_CONVERT_K,
         LIFT_SUBSTEP);
+    
+    LOG_DEBUG("Mechanism", "Configuring extension stepper...");
     _extension.init(EXTENSION_STEPPER_ID, &_stepperProtocol);
     _extension.set(
         EXTENSION_SPEED,
@@ -51,6 +81,8 @@ void MechanismTaskExecutor::begin(uint8_t initialStorageSlot)
         EXTENSION_CW,
         EXTENSION_CONVERT_K,
         EXTENSION_SUBSTEP);
+    
+    LOG_DEBUG("Mechanism", "Configuring base stepper...");
     _base.init(BASE_STEPPER_ID, &_baseProtocol);
     _base.set(
         BASE_SPEED,
@@ -63,13 +95,25 @@ void MechanismTaskExecutor::begin(uint8_t initialStorageSlot)
      * 使用FSUS底层的完整初始化，同步当前角度并明确设置单圈模式。
      * 不使用FSGP_Gripper：其负载检测未实现，open/wait又会阻塞主循环。
      */
+    LOG_DEBUG("Mechanism", "Initializing servos...");
+    LOGF_DEBUG("Mechanism", "Initializing storage servo (ID=%d)...", STORAGE_SERVO_ID);
     _storageServo.init(STORAGE_SERVO_ID, &_servoProtocol);
+    LOGF_DEBUG("Mechanism", "Initializing gripper servo (ID=%d)...", GRIPPER_SERVO_ID);
     _gripperServo.init(GRIPPER_SERVO_ID, &_servoProtocol);
+    
+    LOGF_INFO("Mechanism", "Servo status: Storage=%s Gripper=%s", 
+              _storageServo.isOnline ? "ONLINE" : "OFFLINE",
+              _gripperServo.isOnline ? "ONLINE" : "OFFLINE");
+    
     if (!_storageServo.isOnline || !_gripperServo.isOnline)
     {
+        LOGF_ERROR("Mechanism", "Servo offline! Storage=%d Gripper=%d", 
+                   _storageServo.isOnline, _gripperServo.isOnline);
         fail("mechanism servo offline");
         return;
     }
+    
+    LOG_DEBUG("Mechanism", "Configuring servo parameters...");
     _gripperServo.setAngleRange(
         min(GRIPPER_OPEN_ANGLE, GRIPPER_OPEN_MAX_ANGLE),
         max(GRIPPER_CLOSE_ANGLE, GRIPPER_OPEN_MAX_ANGLE));
@@ -89,6 +133,8 @@ void MechanismTaskExecutor::begin(uint8_t initialStorageSlot)
     _pickupReferenceValid = false;
     _pickupTargetSeen = false;
     _fault = "";
+    
+    LOG_INFO("Mechanism", "Starting initialization action sequence...");
     loadInitializationAction();
 }
 
@@ -730,16 +776,24 @@ void MechanismTaskExecutor::loadTravelAction(
 void MechanismTaskExecutor::loadInitializationAction()
 {
     clearAction();
+    LOG_INFO("Mechanism", "Loading init action: 5 steps");
     addStep(StepKind::Lift, LIFT_INITIAL);
+    LOGF_DEBUG("Mechanism", "  - Step 1: Lift to %.1f", LIFT_INITIAL);
     addStep(StepKind::RotateBase, BASE_INITIAL);
+    LOGF_DEBUG("Mechanism", "  - Step 2: Base to %.1f deg", BASE_INITIAL);
     addConcurrentStep(StepKind::Extend, EXTENSION_INITIAL);
+    LOGF_DEBUG("Mechanism", "  - Step 3: Extend to %.1f", EXTENSION_INITIAL);
     addConcurrentStep(
         StepKind::RotateStorage,
         TRAY_SLOT_ANGLE[_initialStorageSlot]);
+    LOGF_DEBUG("Mechanism", "  - Step 4: Storage to slot %d (%.1f deg)", 
+              _initialStorageSlot, TRAY_SLOT_ANGLE[_initialStorageSlot]);
     // 初始化时夹爪内没有物料，只按角度确认空载闭合。
     addConcurrentStep(
         StepKind::CloseGripperUnloaded,
         GRIPPER_CLOSE_ANGLE);
+    LOGF_DEBUG("Mechanism", "  - Step 5: Close gripper to %.1f deg", GRIPPER_CLOSE_ANGLE);
+    LOG_INFO("Mechanism", "Init action loaded, starting execution...");
 }
 
 void MechanismTaskExecutor::loadTurntablePreparationAction(
@@ -1610,6 +1664,13 @@ bool MechanismTaskExecutor::updateCurrentStep()
 
     const uint8_t activeGroup = _steps[_stepIndex].group;
     bool groupCompleted = true;
+    
+    static uint8_t lastLoggedGroup = 255;
+    if (activeGroup != lastLoggedGroup)
+    {
+        LOGF_DEBUG("Mechanism", "Executing step group %d", activeGroup);
+        lastLoggedGroup = activeGroup;
+    }
 
     for (uint8_t i = _stepIndex;
          i < _stepCount && _steps[i].group == activeGroup;
@@ -1619,7 +1680,10 @@ bool MechanismTaskExecutor::updateCurrentStep()
         if (!step.completed)
             step.completed = updateActionStep(step);
         if (_result == AsyncResult::Failed)
+        {
+            LOG_ERROR("Mechanism", "Step execution failed!");
             return false;
+        }
         if (!step.completed)
             groupCompleted = false;
     }
@@ -1670,6 +1734,13 @@ bool MechanismTaskExecutor::issueStepperCommand(
     bool angle)
 {
     resetStepperState(motor);
+    LOGF_INFO(
+        "Mechanism",
+        "Stepper command: id=%u kind=%u target_x10=%ld angle=%u",
+        motor.addr,
+        static_cast<unsigned>(step.kind),
+        static_cast<long>(step.target * 10.0F),
+        angle ? 1U : 0U);
     bool commandAccepted = false;
     if (angle)
     {
@@ -1766,6 +1837,12 @@ bool MechanismTaskExecutor::issueStepperCommand(
 
     if (!commandAccepted)
     {
+        LOGF_ERROR(
+            "Mechanism",
+            "Stepper command rejected: id=%u kind=%u target_x10=%ld",
+            motor.addr,
+            static_cast<unsigned>(step.kind),
+            static_cast<long>(step.target * 10.0F));
         fail(stepperCommandFaultMessage(motor));
         return false;
     }
@@ -1824,6 +1901,7 @@ bool MechanismTaskExecutor::updateStepperStep(
 
     if (now - step.startedMs >= STEPPER_TIMEOUT_MS)
     {
+        LOGF_ERROR("Mechanism", "Stepper timeout: %s", stepperTimeoutMessage(motor));
         fail(stepperTimeoutMessage(motor));
         return false;
     }
@@ -2046,6 +2124,7 @@ void MechanismTaskExecutor::onActionCompleted()
     switch (_phase)
     {
     case TaskPhase::Initializing:
+        LOG_INFO("Mechanism", "Initialization complete - mechanism ready!");
         _initialized = true;
         _phase = TaskPhase::Idle;
         _result = AsyncResult::Succeeded;

@@ -4,7 +4,12 @@
 
 namespace debug_config
 {
-    // 独立USB-TTL调试串口，与new_project保持一致。
+    // 调试输出选项：
+    // - false: 使用独立USB-TTL (PB12/PB13)
+    // - true: 使用USB CDC虚拟串口 (Serial, 通过DAP-Link)
+    constexpr bool USE_USB_CDC = true;
+    
+    // 独立USB-TTL调试串口引脚（USE_USB_CDC=false时使用）
     constexpr uint32_t RX_PIN = PB12;
     constexpr uint32_t TX_PIN = PB13;
     constexpr uint32_t BAUD = 115200;

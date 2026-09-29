@@ -223,12 +223,19 @@ void MaixProRingAlignment::update()
     if (detection.mode != _targetMode ||
         detection.targetId != _targetSelector)
     {
+        _debug.lastMode = detection.mode;
+        _debug.lastTargetId = detection.targetId;
+        ++_debug.observations;
+        ++_debug.ignoredObservations;
         return;
     }
 
     _lastObservationMs = now;
     _debug.hasObservation = true;
     _debug.found = detection.found;
+    _debug.lastMode = detection.mode;
+    _debug.lastTargetId = detection.targetId;
+    ++_debug.observations;
     _debug.dx = detection.dx;
     _debug.dy = detection.dy;
     _debug.quality = detection.quality;

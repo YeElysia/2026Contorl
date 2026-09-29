@@ -1,6 +1,7 @@
 #include "ChassisControl.h"
 
 #include "ChassisEmm42TtlFeedback.h"
+#include "DebugLog.h"
 #include "chassis_config.h"
 #include <math.h>
 #include <string.h>
@@ -229,6 +230,11 @@ bool ChassisControl::moveBodyRelativeInternal(
         maximumSpeed,
         maximumAcceleration);
     _state = State::Translating;
+    
+    // 记录日志
+    LOGF_INFO("Chassis", "MOVE_START forward=%.1fmm right=%.1fmm yaw=%.1f° speed=%.0fRPM", 
+              forwardMm, rightMm, _holdYawDeg, maxRpm);
+    
     return true;
 }
 
@@ -265,6 +271,10 @@ bool ChassisControl::moveWorldRelative(
         _worldPose.yawDeg,
         forwardMm,
         rightMm);
+    
+    LOGF_DEBUG("Chassis", "WORLD_MOVE world=(%.1f,%.1f) body=(%.1f,%.1f) yaw=%.1f°",
+               worldXMm, worldYMm, forwardMm, rightMm, _worldPose.yawDeg);
+    
     return moveBodyRelative(
         forwardMm,
         rightMm,
@@ -303,6 +313,10 @@ bool ChassisControl::rotateTo(float absoluteYawDeg)
     _motionTimeoutMs = estimateRotationTimeoutMs(
         fabsf(wrap180(_rotateTargetDeg - _yawDeg)));
     _state = State::Rotating;
+    
+    LOGF_INFO("Chassis", "ROTATE_START current=%.1f° target=%.1f° delta=%.1f°",
+              _yawDeg, _rotateTargetDeg, wrap180(_rotateTargetDeg - _yawDeg));
+    
     return true;
 }
 
@@ -557,7 +571,12 @@ void ChassisControl::updateTranslation()
         if (updateYawSettle(
                 _holdYawDeg,
                 TRANSLATION_FINAL_HEADING_TOLERANCE_DEG))
+        {
             _state = State::Idle;
+            LOGF_INFO("Chassis", "MOVE_COMPLETE pose=(%.1f, %.1f, %.1f°) duration=%lums",
+                      _worldPose.xMm, _worldPose.yMm, _worldPose.yawDeg, 
+                      millis() - _motionStartMs);
+        }
         return;
     }
 
@@ -633,7 +652,11 @@ void ChassisControl::updateRotation()
     }
 
     if (updateYawSettle(_rotateTargetDeg, ROTATE_TOLERANCE_DEG))
+    {
         _state = State::Idle;
+        LOGF_INFO("Chassis", "ROTATE_COMPLETE current=%.1f° target=%.1f° duration=%lums",
+                  _yawDeg, _rotateTargetDeg, millis() - _motionStartMs);
+    }
 }
 
 void ChassisControl::updateStopping()
@@ -779,6 +802,8 @@ void ChassisControl::setFault(const char *message)
     _fault[sizeof(_fault) - 1] = '\0';
     syncTargets();
     _state = State::Fault;
+    
+    LOGF_ERROR("Chassis", "FAULT: %s", message);
 }
 
 void ChassisControl::syncTargets()

@@ -1,4 +1,5 @@
 #include "TTL_STEPPER.h"
+#include "DebugLog.h"
 // CRC_8校验
 //  unsigned char calculateCRC8(unsigned char *p, unsigned char len)
 //  {
@@ -511,7 +512,13 @@ int TTL_Stepper::Emm_V5_Origin_Read_state()
  */
 bool TTL_Stepper::wrong_command_catch()
 {
-    int erroraddr = protocol->error_address_catch();
+    const int erroraddr = protocol->error_address_catch();
+    LOGF_INFO(
+        "Stepper",
+        "ack id=%u result=%d avail=%d",
+        addr,
+        erroraddr,
+        protocol->serial->available());
     if (erroraddr == addr || erroraddr == 254)
     {
         command_check = 0;
@@ -885,9 +892,11 @@ void TTL_Protocol::Emm_V5_Receive_Data(uint8_t *rxCmd, uint8_t *rxCount)
     int i = 0;
     unsigned long lTime;  // 上一时刻的时间
     unsigned long cTime;  // 当前时刻的时间
+    const unsigned long startTime = millis();
     bool end_rec = false; // 是否接收到了帧尾
+    const unsigned long totalTimeout = 50;
     // 记录当前的时间
-    lTime = cTime = millis();
+    lTime = cTime = startTime;
 
     // 开始接收数据
     while (1)
@@ -914,7 +923,9 @@ void TTL_Protocol::Emm_V5_Receive_Data(uint8_t *rxCmd, uint8_t *rxCount)
         {
             cTime = millis(); // 获取当前时刻的时间
 
-            if ((int)(cTime - lTime) > 50 || end_rec) // 50毫秒内串口没有数据进来或已经接收到帧尾，就判定一帧数据接收结束
+            if ((int)(cTime - lTime) > 50 ||
+                (int)(cTime - startTime) >= (int)totalTimeout ||
+                end_rec) // 无应答也必须在总超时后退出
             {
                 *rxCount = i; // 数据长度
 
@@ -986,6 +997,11 @@ uint8_t TTL_Protocol::error_address_catch()
     uint8_t rxCmd[256] = {};
     uint8_t rxCount = 0;
     this->Emm_V5_Receive_Data(rxCmd, &rxCount);
+    if (rxCount == 0)
+    {
+        LOG_INFO("Stepper", "ack timeout: no response");
+        return 254;
+    }
     for (uint16_t i = 0; i + 3 < rxCount; ++i) {
         if(rxCmd[i+3]!=0x6B){
             continue;
@@ -1000,6 +1016,7 @@ uint8_t TTL_Protocol::error_address_catch()
             return 255;
         }
     }
+    LOGF_INFO("Stepper", "ack invalid frame bytes=%u first=%u", rxCount, rxCmd[0]);
     return 254;//没有接收到返回
     // uint8_t *rxCmd;
     // int i = -1;

@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include "DebugLog.h"
 
 NextionMissionDisplay::NextionMissionDisplay(
     HardwareSerial &serial,
@@ -17,8 +18,11 @@ void NextionMissionDisplay::begin(
     uint32_t baud,
     uint32_t restartWaitMs)
 {
+    LOG_DEBUG("Display", "Starting serial.begin()...");
     _serial.begin(baud);
+    LOG_DEBUG("Display", "Serial initialized, sending rest command...");
     sendCommand("rest");
+    LOG_DEBUG("Display", "Rest command sent");
 
     /*
      * 屏幕重启期间不使用delay()，底盘和IMU仍可正常更新。
@@ -27,6 +31,7 @@ void NextionMissionDisplay::begin(
     _screenReadyMs = millis() + restartWaitMs;
     _lastState = static_cast<MissionController::State>(0xFF);
     _lastQrText[0] = '\0';
+    LOG_INFO("Display", "Display initialization complete");
 }
 
 void NextionMissionDisplay::update()

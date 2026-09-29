@@ -14,6 +14,17 @@
  */
 namespace mechanism_config
 {
+    // -------------------- 调试选项 --------------------
+    /**
+     * @brief 跳过机构初始化（用于测试底盘和视觉系统）
+     *
+     * 设置为true时，机构会立即报告ready状态而不执行初始化动作。
+     * 这允许在机构硬件未连接时测试底盘移动和视觉系统。
+     *
+     * ⚠️ 生产环境必须设置为false！
+     */
+    constexpr bool SKIP_MECHANISM_INIT = false;
+
     // -------------------- 硬件映射（以new_project为准） --------------------
     constexpr uint32_t STEPPER_RX_PIN = PA3;
     constexpr uint32_t STEPPER_TX_PIN = PA2;
@@ -156,9 +167,9 @@ namespace mechanism_config
      */
     constexpr RingPose ROUGH_RING_POSES[4] = {
         {BASE_TRAY_TRANSFER, 0.0F, 0.0F},
-        {2296.0F, 1180.0F, 803.0F},  // 1号圆环
-        {1805.0F, 1180.0F, 1600.0F}, // 2号圆环
-        {1305.0F, 1180.0F, 1035.0F}, // 3号圆环
+        {2245.0F, 1210.0F, 805.0F},  // 1号圆环
+        {1820.0F, 1190.0F, 1570.0F}, // 2号圆环
+        {1357.0F, 1190.0F, 1140.0F}, // 3号圆环
     };
 
     /*
@@ -167,9 +178,9 @@ namespace mechanism_config
      */
     constexpr RingPose FINAL_STORAGE_RING_POSES[4] = {
         {BASE_TRAY_TRANSFER, 0.0F, 0.0F},
-        {2296.0F, 1175.0F, 803.0F},  // 1号圆环
-        {1805.0F, 1175.0F, 1600.0F}, // 2号圆环
-        {1305.0F, 1175.0F, 1035.0F}, // 3号圆环
+        {2258.0F, 1215.0F, 870.0F},  // 1号圆环
+        {1820.0F, 1190.0F, 1595.0F}, // 2号圆环
+        {1365.0F, 1190.0F, 1110.0F}, // 3号圆环
     };
 
     // -------------------- 非阻塞执行保护 --------------------

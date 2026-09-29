@@ -2,6 +2,7 @@
 #include <OneButton.h>
 
 #include "ChassisControl.h"
+#include "DebugLog.h"
 #include "GraspForwardPositioner.h"
 #include "MissionController.h"
 #include "MaixProGraspVision.h"
@@ -142,9 +143,14 @@ void setup()
     pinMode(mission_config::STATUS_LED_PIN, OUTPUT);
     digitalWrite(mission_config::STATUS_LED_PIN, LOW);
 
+    // 初始化调试日志系统
+    DebugLog::begin(&serialDebug, debug_config::BAUD, DebugLog::Level::INFO);
+    LOG_INFO("System", "=== 2026 GCDS Control System Starting ===");
+
     startButton.reset();
     startButton.attachClick(onStartButtonClicked);
 
+    LOG_INFO("Init", "Initializing chassis...");
     chassis.begin();
     /*
      * 底盘内部记录的是场地绝对坐标。此时IMU可能尚未输出首帧，
@@ -154,28 +160,64 @@ void setup()
         field_config::START_X_MM,
         field_config::START_Y_MM,
         field_config::START_YAW_DEG);
+    LOGF_INFO("Init", "Start pose: (%.1f, %.1f, %.1f°)", 
+              field_config::START_X_MM, 
+              field_config::START_Y_MM, 
+              field_config::START_YAW_DEG);
+
+    LOG_INFO("Init", "Initializing vision camera...");
     camera.begin(vision_config::BAUD);
+    
+    LOG_INFO("Init", "Initializing QR code scanner...");
     missionData.begin();
+    
+    LOG_INFO("Init", "Initializing mission controller...");
     mission.begin(mission_config::STARTUP_STABLE_MS);
+    
+    LOG_INFO("Init", "Initializing diagnostics...");
     diagnostics.begin(debug_config::BAUD);
+    
+    LOG_INFO("Init", "Initializing mechanism...");
     stationTask.begin();
+    
+    LOG_INFO("Init", "Initializing display...");
     display.begin(
         mission_config::SCREEN_BAUD,
         mission_config::SCREEN_RESTART_WAIT_MS);
+    
+    delay(200); // 等待显示器串口命令完全发送
+    
+    LOG_INFO("System", "=== Initialization Complete ===");
+    LOG_INFO("System", "Entering main loop...");
 }
 
 void loop()
 {
-    /*
-     * 所有模块都采用非阻塞update()：
-     * - ChassisControl解析IMU并产生STEP脉冲；
-     * - MissionController推进路线、视觉和机构任务；
-     * - OneButton处理按键消抖。
-     */
-    // 按键必须优先扫描，避免机构串口查询拉长循环后漏掉短按。
+    static bool firstLoop = true;
+    if (firstLoop)
+    {
+        serialDebug.println("LOOP_ENTER");
+        firstLoop = false;
+    }
+
     startButton.tick();
     chassis.update();
+
+    static bool beforeMissionReported = false;
+    if (!beforeMissionReported)
+    {
+        serialDebug.println("BEFORE_MISSION");
+        beforeMissionReported = true;
+    }
     mission.update();
+
+    static bool afterMissionReported = false;
+    if (!afterMissionReported)
+    {
+        serialDebug.println("AFTER_MISSION");
+        afterMissionReported = true;
+    }
+
     diagnostics.update(
         debug_config::STARTUP_REPORT_INTERVAL_MS,
         !chassis.busy());

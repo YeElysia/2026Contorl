@@ -30,6 +30,10 @@ public:
         float worldCorrectionMm = 0.0F;
         uint8_t targetMode = maixcam::MODE_IDLE;
         uint8_t targetSelector = 0;
+        uint8_t lastMode = maixcam::MODE_IDLE;
+        uint8_t lastTargetId = 0;
+        uint32_t observations = 0;
+        uint32_t ignoredObservations = 0;
     };
 
     MaixProRingAlignment(

@@ -118,7 +118,7 @@ namespace vision_config
      */
     constexpr int16_t RING_CENTER_TOLERANCE_PX = 1;
     constexpr int16_t RING_FINE_ALIGNMENT_ZONE_PX = 25;
-    constexpr uint8_t RING_REQUIRED_STABLE_FRAMES = 3;
+    constexpr uint8_t RING_REQUIRED_STABLE_FRAMES = 30;
     constexpr uint8_t RING_MIN_QUALITY = 30;
 
     /*
