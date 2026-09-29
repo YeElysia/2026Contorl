@@ -1,6 +1,6 @@
 #pragma once
 
-#include <AccelStepper.h>
+#include "ChassisStepperDriver.h"
 #include <Arduino.h>
 
 class ChassisEmm42TtlFeedback;
@@ -154,7 +154,7 @@ private:
 
     HardwareSerial *_imuSerial;
     ChassisEmm42TtlFeedback *_motorFeedback;
-    AccelStepper _motors[4];
+    ChassisStepperDriver _driver;
 
     State _state = State::Idle;
     char _fault[80] = {};
@@ -210,8 +210,6 @@ private:
     void runYawController(float errorDeg);
     void resetYawStability();
     void setFault(const char *message);
-    void syncTargets();
-    bool allMotorsStopped();
 
     static float distanceScale(
         float distance,

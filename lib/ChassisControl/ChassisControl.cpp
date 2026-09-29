@@ -12,12 +12,7 @@ ChassisControl::ChassisControl(
     HardwareSerial *imuSerial,
     ChassisEmm42TtlFeedback *motorFeedback)
     : _imuSerial(imuSerial),
-      _motorFeedback(motorFeedback),
-      _motors{
-          AccelStepper(AccelStepper::DRIVER, STEP_PINS[0], DIR_PINS[0]),
-          AccelStepper(AccelStepper::DRIVER, STEP_PINS[1], DIR_PINS[1]),
-          AccelStepper(AccelStepper::DRIVER, STEP_PINS[2], DIR_PINS[2]),
-          AccelStepper(AccelStepper::DRIVER, STEP_PINS[3], DIR_PINS[3])}
+      _motorFeedback(motorFeedback)
 {
 }
 
@@ -26,18 +21,8 @@ void ChassisControl::begin()
     pinMode(ENABLE_PIN, OUTPUT);
     digitalWrite(ENABLE_PIN, LOW);
 
-    const float maxSpeed = rpmToStepsPerSecond(DRIVE_RPM);
-    const float acceleration =
-        rpmToStepsPerSecond(DRIVE_ACCEL_RPM_PER_S);
-    for (auto &motor : _motors)
-    {
-        motor.setMaxSpeed(maxSpeed);
-        motor.setAcceleration(acceleration);
-        motor.setMinPulseWidth(STEP_PULSE_WIDTH_US);
-        motor.setCurrentPosition(0);
-    }
-    for (uint8_t i = 0; i < 4; ++i)
-        _lastOdometrySteps[i] = _motors[i].currentPosition();
+    _driver.begin();
+    _driver.positions(_lastOdometrySteps);
 
     if (_imuSerial != nullptr)
         _imuSerial->begin(IMU_BAUD);
@@ -66,6 +51,12 @@ void ChassisControl::update()
     }
     updateOdometry();
 
+    if (_driver.takeWatchdogTrip() && _state != State::Fault)
+    {
+        setFault("control loop stalled");
+        return;
+    }
+
     if (_state != State::Idle &&
         _state != State::Fault &&
         millis() - _motionStartMs > _motionTimeoutMs)
@@ -91,9 +82,6 @@ void ChassisControl::update()
     default:
         break;
     }
-
-    // 记录本次run()/runSpeed()实际产生的脉冲，避免位姿落后一轮。
-    updateOdometry();
 }
 
 bool ChassisControl::moveBodyRelative(
@@ -203,17 +191,12 @@ bool ChassisControl::moveBodyRelativeInternal(
             static_cast<float>(maximumPulses);
         _translationSpeed[i] = maximumSpeed * ratio;
 
-        if (wheelPulses[i] != 0)
-        {
-            _motors[i].setMaxSpeed(_translationSpeed[i]);
-            _motors[i].setAcceleration(maximumAcceleration * ratio);
-            _motors[i].move(wheelPulses[i]);
-        }
-        else
-        {
-            // 45°斜移时可能有两个轮子理论行程为零。
-            _motors[i].moveTo(_motors[i].currentPosition());
-        }
+        // 45°斜移时可能有两个轮子理论行程为零，此时原地保持。
+        _driver.moveRelative(
+            i,
+            wheelPulses[i],
+            _translationSpeed[i],
+            maximumAcceleration * ratio);
     }
 
     // 记录起步航向。updateTranslation() 会在整个移动期间保持该角度。
@@ -334,24 +317,17 @@ bool ChassisControl::rotateWorldTo(float worldYawDeg)
 
 void ChassisControl::stop()
 {
-    if (_state == State::Fault)
+    if (_state == State::Fault || _state == State::Idle)
     {
-        syncTargets();
-        return;
-    }
-
-    if (_state == State::Idle)
-    {
-        syncTargets();
+        _driver.halt();
         return;
     }
 
     /*
-     * 不在stop()里阻塞一秒。给每个轴生成减速目标，后续由update()
-     * 持续产生脉冲，这样IMU、视觉和机构状态机不会被底盘急停卡住。
+     * 不在stop()里阻塞。脉冲中断沿减速曲线停车，update()只检查
+     * 是否停稳，IMU、视觉和机构状态机不会被底盘急停卡住。
      */
-    for (auto &motor : _motors)
-        motor.stop();
+    _driver.stop();
 
     _motionStartMs = millis();
     _motionTimeoutMs = STOP_TIMEOUT_MS;
@@ -360,7 +336,8 @@ void ChassisControl::stop()
 
 void ChassisControl::clearFault()
 {
-    syncTargets();
+    _driver.halt();
+    _driver.takeWatchdogTrip();
     if (_motorFeedback != nullptr)
         _motorFeedback->clearFault();
     _fault[0] = '\0';
@@ -428,8 +405,7 @@ bool ChassisControl::resetWorldPose(
         _worldYawOffsetReady = false;
     }
 
-    for (uint8_t i = 0; i < 4; ++i)
-        _lastOdometrySteps[i] = _motors[i].currentPosition();
+    _driver.positions(_lastOdometrySteps);
     return true;
 }
 
@@ -446,8 +422,7 @@ bool ChassisControl::correctWorldPosition(
 
     _worldPose.xMm = worldXmm;
     _worldPose.yMm = worldYmm;
-    for (uint8_t i = 0; i < 4; ++i)
-        _lastOdometrySteps[i] = _motors[i].currentPosition();
+    _driver.positions(_lastOdometrySteps);
     return true;
 }
 
@@ -505,13 +480,15 @@ bool ChassisControl::updateImu()
 
 void ChassisControl::updateOdometry()
 {
+    long current[4] = {};
+    _driver.positions(current);
+
     float wheelMm[4] = {};
     bool moved = false;
     for (uint8_t i = 0; i < 4; ++i)
     {
-        const long current = _motors[i].currentPosition();
-        const long deltaSteps = current - _lastOdometrySteps[i];
-        _lastOdometrySteps[i] = current;
+        const long deltaSteps = current[i] - _lastOdometrySteps[i];
+        _lastOdometrySteps[i] = current[i];
         wheelMm[i] =
             static_cast<float>(deltaSteps) /
             (STEPS_PER_MM * MOTOR_SIGN[i]);
@@ -594,7 +571,7 @@ void ChassisControl::updateTranslation()
          */
         for (uint8_t i = 0; i < 4; ++i)
         {
-            if (_motors[i].distanceToGo() != 0)
+            if (_driver.distanceToGo(i) != 0)
                 maxCorrection =
                     min(maxCorrection, _translationSpeed[i] * 0.8f);
         }
@@ -605,11 +582,11 @@ void ChassisControl::updateTranslation()
     }
 
     // 同号的有符号轮速修正产生原地旋转，不改变主要平移组合。
-    // AccelStepper 的 run() 根据目标位置确定方向，因此这里根据
+    // 位置模式由剩余行程决定方向，因此这里根据
     // distanceToGo() 的符号把修正量换算成各轮速度幅值。
     for (uint8_t i = 0; i < 4; ++i)
     {
-        const long remaining = _motors[i].distanceToGo();
+        const long remaining = _driver.distanceToGo(i);
         if (remaining == 0)
             continue;
 
@@ -618,13 +595,12 @@ void ChassisControl::updateTranslation()
             direction * _translationSpeed[i] + correction;
         // 只防止零速度；不能设置较高的固定下限，否则会破坏
         // 很短行程轮与长行程轮之间的同步比例。
-        _motors[i].setMaxSpeed(max(1.0f, fabsf(signedSpeed)));
-        _motors[i].run();
+        _driver.setMaxSpeed(i, max(1.0f, fabsf(signedSpeed)));
     }
 
-    if (allMotorsStopped())
+    if (_driver.allStopped())
     {
-        syncTargets();
+        _driver.halt();
         if (_translationHeadingEnabled &&
             _translationFinalHeadingSettleEnabled)
         {
@@ -661,12 +637,9 @@ void ChassisControl::updateRotation()
 
 void ChassisControl::updateStopping()
 {
-    for (auto &motor : _motors)
-        motor.run();
-
-    if (allMotorsStopped())
+    if (_driver.allStopped())
     {
-        syncTargets();
+        _driver.halt();
         _state = State::Idle;
     }
 }
@@ -679,7 +652,12 @@ bool ChassisControl::updateYawSettle(
     if (fabsf(error) <= toleranceDeg)
     {
         // 进入容差带后停止继续发脉冲；若被惯性带出，再从零平滑纠偏。
+        // 每轮都下发零速，同时刷新脉冲中断的速度看门狗。
         _rotateCommandSpeed = 0.0F;
+        const float zero[4] = {};
+        _driver.setVelocities(
+            zero,
+            rpmToStepsPerSecond(ROTATE_ACCEL_RPM_PER_S));
 
         /*
          * loop频率远高于IMU输出频率。只有收到一帧新的有效角度数据
@@ -697,7 +675,7 @@ bool ChassisControl::updateYawSettle(
         if (_stableSamples >= ROTATE_STABLE_SAMPLES &&
             millis() - _stableSinceMs >= ROTATE_STABLE_TIME_MS)
         {
-            syncTargets();
+            _driver.halt();
             return true;
         }
         return false;
@@ -754,8 +732,8 @@ void ChassisControl::runYawController(float errorDeg)
     }
 
     /*
-     * AccelStepper::runSpeed()本身不使用setAcceleration()。这里按真实
-     * 时间限制每次速度变化量，使ROTATE_ACCEL_RPM_PER_S实际生效。
+     * 按真实时间限制每次速度变化量，使ROTATE_ACCEL_RPM_PER_S实际生效。
+     * 脉冲中断也按同一加速度限速，这里的斜坡保证PD输出本身平滑。
      */
     const uint32_t nowUs = micros();
     const float elapsedSeconds = min(
@@ -769,18 +747,12 @@ void ChassisControl::runYawController(float errorDeg)
         maximumDelta);
 
     // 当前接线下，四个电机同号脉冲对应原地旋转。
-    for (auto &motor : _motors)
-    {
-        /*
-         * 前一次斜移可能给四轮留下不同的maxSpeed/acceleration。
-         * 原地旋转前必须统一恢复，否则setSpeed()会被各自的旧上限
-         * 裁成不同轮速。
-         */
-        motor.setMaxSpeed(limit);
-        motor.setAcceleration(acceleration);
-        motor.setSpeed(_rotateCommandSpeed);
-        motor.runSpeed();
-    }
+    const float speeds[4] = {
+        _rotateCommandSpeed,
+        _rotateCommandSpeed,
+        _rotateCommandSpeed,
+        _rotateCommandSpeed};
+    _driver.setVelocities(speeds, acceleration);
 }
 
 void ChassisControl::resetYawStability()
@@ -800,26 +772,10 @@ void ChassisControl::setFault(const char *message)
 {
     strncpy(_fault, message, sizeof(_fault) - 1);
     _fault[sizeof(_fault) - 1] = '\0';
-    syncTargets();
+    _driver.halt();
     _state = State::Fault;
-    
+
     LOGF_ERROR("Chassis", "FAULT: %s", message);
-}
-
-void ChassisControl::syncTargets()
-{
-    for (auto &motor : _motors)
-        motor.moveTo(motor.currentPosition());
-}
-
-bool ChassisControl::allMotorsStopped()
-{
-    for (auto &motor : _motors)
-    {
-        if (motor.distanceToGo() != 0)
-            return false;
-    }
-    return true;
 }
 
 float ChassisControl::wrap180(float angleDeg)

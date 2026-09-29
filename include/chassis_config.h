@@ -10,10 +10,17 @@ namespace chassis_config
     constexpr uint32_t STEP_PINS[4] = {PD4, PE11, PD15, PA1};
 
     /*
-     * EMM42 V5 的PUL输入需要留足高电平宽度。AccelStepper默认值
-     * 偏短，这里固定为3us，兼顾可靠识别和当前最高脉冲频率。
+     * 四轮STEP脉冲由TIM13定时中断产生（TIM6/TIM7留给core的tone/Servo）。
+     * 每个tick先拉低上一拍的STEP，再决定是否发新脉冲，所以高电平宽度
+     * 等于一个tick（100kHz → 10us），EMM42 V5要求≥3us。
+     * 优先级低于UART(1)和SysTick(0)，高于core默认定时器(14)。
      */
-    constexpr uint16_t STEP_PULSE_WIDTH_US = 3;
+    constexpr uint32_t STEP_TIMER_HZ = 100000;
+    constexpr uint32_t STEP_TIMER_IRQ_PRIORITY = 2;
+    // 单轮最高脉冲频率；至少隔一个tick才能再发脉冲，因此不超过tick的一半。
+    constexpr float MAX_STEP_RATE = 50000.0f;
+    // 速度模式（原地旋转/航向静定）超过该时间没有刷新指令，中断自行减速到零。
+    constexpr uint32_t VELOCITY_WATCHDOG_MS = 100;
 
     // WIT/JY901 IMU 串口。PB12/PB13不启用，避免影响底盘。
     constexpr uint32_t IMU_RX_PIN = PD9;
@@ -57,10 +64,11 @@ namespace chassis_config
     /*
      * 运动参数（单位：轮子RPM、RPM/s、度）。
      *
-     * 快速档用于长距离转场。AccelStepper会根据剩余距离自动减速，
+     * 快速档用于长距离转场。脉冲中断按剩余距离自动减速，
      * 因此提高最高转速不会让电机以最高速度撞到目标点。
+     * 450RPM = 48000 steps/s，受MAX_STEP_RATE限制；实际路线峰值约30~38k。
      */
-    constexpr float DRIVE_RPM = 800.0f;
+    constexpr float DRIVE_RPM = 450.0f;
 
     /*
      * 快速档加速度
@@ -113,8 +121,17 @@ namespace chassis_config
     // 防止错误任务数据被换算成溢出的脉冲目标。
     constexpr float MAX_SINGLE_MOVE_COMPONENT_MM = 5000.0f;
 
-    static_assert(STEP_PULSE_WIDTH_US >= 3,
+    static_assert(1000000UL / STEP_TIMER_HZ >= 3,
                   "EMM42 V5 step pulse width must be at least 3us");
+    static_assert(MAX_STEP_RATE * 2.0f <= static_cast<float>(STEP_TIMER_HZ),
+                  "step rate needs at least one low tick between pulses");
+    static_assert(STEP_TIMER_IRQ_PRIORITY >= 1 && STEP_TIMER_IRQ_PRIORITY < 16,
+                  "step timer priority must be maskable by BASEPRI");
+    static_assert(DRIVE_RPM * STEPS_PER_REV / 60.0f <= MAX_STEP_RATE &&
+                      PRECISE_DRIVE_RPM * STEPS_PER_REV / 60.0f <= MAX_STEP_RATE &&
+                      GRASP_TRACK_DRIVE_RPM * STEPS_PER_REV / 60.0f <= MAX_STEP_RATE &&
+                      ROTATE_MAX_RPM * STEPS_PER_REV / 60.0f <= MAX_STEP_RATE,
+                  "chassis speed profile exceeds MAX_STEP_RATE");
     static_assert(FORWARD_DISTANCE_SCALE > 0.0f &&
                       BACKWARD_DISTANCE_SCALE > 0.0f &&
                       RIGHT_DISTANCE_SCALE > 0.0f &&
