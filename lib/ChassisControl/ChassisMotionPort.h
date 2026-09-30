@@ -19,6 +19,19 @@ public:
         float targetWorldYMm,
         float maxRpm,
         float accelerationRpmPerS);
+    bool moveWorldThrough(
+        float viaWorldXMm,
+        float viaWorldYMm,
+        float targetWorldXMm,
+        float targetWorldYMm,
+        float maxRpm,
+        float accelerationRpmPerS);
+    bool moveWorldToPose(
+        float targetWorldXMm,
+        float targetWorldYMm,
+        float worldYawDeg,
+        float maxRpm,
+        float accelerationRpmPerS);
     bool rotateWorldTo(float worldYawDeg);
     bool moveBodyRelative(
         float forwardMm,

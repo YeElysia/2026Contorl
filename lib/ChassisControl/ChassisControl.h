@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ChassisStepperDriver.h"
+#include "ChassisTracking.h"
 #include <Arduino.h>
 
 class ChassisEmm42TtlFeedback;
@@ -67,8 +68,9 @@ public:
      *  rightMm   > 0：向车体右侧横移；rightMm   < 0：向左横移。
      *  两个分量可同时给出，从而执行斜向移动。
      *
-     *  运动开始时记录当前 IMU 航向，移动过程中自动抑制偏航。
-     *  maxRpm和accelerationRpmPerS分别指定轮子转速与加速度，
+     *  车体方向按航向参考（最近一次旋转目标）换算成世界目标点，
+     *  移动中闭环跟踪直线路径并锁定该航向。
+     *  maxRpm和accelerationRpmPerS是最大轮速与轮加速度，
      *  供路线执行器选择快速或精确档。
      *  本函数只下发目标，不阻塞等待；必须在 loop() 中持续调用 update()。
      *
@@ -104,8 +106,7 @@ public:
     /**
      * @brief 按世界坐标增量移动（+x向初始左侧，+y向初始车头）。
      *
-     * 本函数在下发时将世界坐标增量转换为当前车体的前后/左右
-     * 分量，随后仍由同一套麦轮控制和航向保持逻辑执行。
+     * 与车体相对移动共用同一套闭环路径跟踪和航向保持逻辑。
      */
     bool moveWorldRelative(
         float worldXMm,
@@ -116,12 +117,42 @@ public:
     /**
      * @brief 移动到世界坐标系中的绝对位置。
      *
-     * 执行时根据当前估计位姿计算世界坐标差值，再转换为车体
-     * 坐标运动。适合比赛主路线和区域基准点，不用于视觉小步微调。
+     * 从当前估计位姿沿直线跟踪到目标点。适合比赛主路线和区域
+     * 基准点，不用于视觉小步微调。
      */
     bool moveWorldTo(
         float targetWorldXMm,
         float targetWorldYMm,
+        float maxRpm,
+        float accelerationRpmPerS);
+
+    /**
+     * @brief 经途经点连续平移到目标，途经点不停车，全程保持航向。
+     *
+     * 第一段参考距途经点剩TRACK_BLEND_DISTANCE_MM时第二段起步，
+     * 两段参考叠加，拐角被圆滑内切。只在最终目标做航向静定。
+     */
+    bool moveWorldThrough(
+        float viaWorldXMm,
+        float viaWorldYMm,
+        float targetWorldXMm,
+        float targetWorldYMm,
+        float maxRpm,
+        float accelerationRpmPerS);
+
+    /**
+     * @brief 一条指令平移并转向到世界位姿（麦轮漂移入位），中途不停车。
+     *
+     * 行进方向取起步航向下最接近目标的车体轴，长直线保持纯前后或
+     * 纯左右运动，保持起步航向。距终点POSE_MOVE_TURN_WINDOW_MM处
+     * 开始旋转，此后平移进度受IMU实测转向进度限制；相对该轴的横向
+     * 偏差也只在窗口内并入。转到位后走完剩余平移并做最终航向静定。
+     * 调用方需保证窗口内路径都有旋转余量。
+     */
+    bool moveWorldToPose(
+        float targetWorldXMm,
+        float targetWorldYMm,
+        float worldYawDeg,
         float maxRpm,
         float accelerationRpmPerS);
 
@@ -171,6 +202,7 @@ private:
     enum class TranslationPhase : uint8_t
     {
         Driving,
+        Braking,
         HeadingSettling
     };
 
@@ -187,6 +219,7 @@ private:
     float _yawDeg = 0.0f;
     bool _imuReady = false;
     uint32_t _lastImuMs = 0;
+    long _imuFrameRotationSteps = 0;
     uint32_t _imuSequence = 0;
     uint32_t _lastEvaluatedImuSequence = 0;
 
@@ -197,40 +230,110 @@ private:
     bool _worldYawOffsetReady = false;
     long _lastOdometrySteps[4] = {};
 
+    // 平移锁定的IMU航向。旋转命令把它设为旋转目标，平移时不再取起步航向。
+    float _headingReferenceDeg = 0.0f;
+    bool _headingReferenceValid = false;
     float _holdYawDeg = 0.0f;
-    // 当前平移中各轮按行程比例分配的巡航速度。
-    // 例如轮子行程为 [700, 300, 300, 700]，速度比例就是
-    // [1, 3/7, 3/7, 1]，从而保证四轮同时到位。
-    float _translationSpeed[4] = {};
-    float _activeTranslationMaximumSpeed = 0.0f;
+
+    // 当前平移的世界坐标直线路径与速度限制（mm、mm/s、mm/s²）。
+    float _trackStartXMm = 0.0f;
+    float _trackStartYMm = 0.0f;
+    float _trackTargetXMm = 0.0f;
+    float _trackTargetYMm = 0.0f;
+    float _trackDirectionX = 0.0f;
+    float _trackDirectionY = 0.0f;
+    // 位姿平移：目标相对行进轴的横偏、转向窗口和IMU系目标航向。
+    // 普通平移窗口为0、横偏为0，_trackYawReached恒为true。
+    float _trackTargetCrossMm = 0.0f;
+    float _trackTurnWindowMm = 0.0f;
+    float _trackTargetYawDeg = 0.0f;
+    float _trackYawTotalDeg = 0.0f;
+    bool _trackTurnStarted = false;
+    bool _trackYawReached = true;
+    float _trackMaximumSpeedMm = 0.0f;
+    float _trackAccelerationMm = 0.0f;
+    float _trackJerkMm = 0.0f;
+    float _trackLengthMm = 0.0f;
+    // 沿程S曲线参考；实际速度=参考速度+位置误差修正。
+    chassis_tracking::JerkState _trackProfile = {};
+    float _trackAlongSpeedMm = 0.0f;
+    float _trackMaximumWheelSpeed = 0.0f;
+    float _trackWheelAcceleration = 0.0f;
+    uint32_t _trackLastControlUs = 0;
+    float _trackHoldWorldYawDeg = 0.0f;
+    float _trackMaxRpm = 0.0f;
+    float _trackAccelerationRpmPerS = 0.0f;
+    // 途经点连续平移：待起步的下一段终点与叠加距离。
+    bool _trackNextPending = false;
+    float _trackNextTargetXMm = 0.0f;
+    float _trackNextTargetYMm = 0.0f;
+    float _trackNextYawDeg = 0.0f;
+    float _trackBlendMm = 0.0f;
+    // 已切到下一段后，上一段尚未走完的参考继续叠加。
+    bool _trackBlendActive = false;
+    float _trackBlendDirectionX = 0.0f;
+    float _trackBlendDirectionY = 0.0f;
+    float _trackBlendLengthMm = 0.0f;
+    float _trackBlendMaximumSpeedMm = 0.0f;
+    float _trackBlendAccelerationMm = 0.0f;
+    float _trackBlendJerkMm = 0.0f;
+    chassis_tracking::JerkState _trackBlendProfile = {};
     bool _translationHeadingEnabled = false;
     bool _translationFinalHeadingSettleEnabled = true;
     TranslationPhase _translationPhase = TranslationPhase::Driving;
     float _rotateTargetDeg = 0.0f;
     float _rotateCommandSpeed = 0.0f;
-    float _rotateFilteredYawRate = 0.0f;
-    float _rotateLastYawDeg = 0.0f;
-    uint32_t _rotateLastYawMs = 0;
-    uint32_t _rotateLastImuSequence = 0;
     uint32_t _rotateLastControlUs = 0;
+    long _rotateStartSteps = 0;
+    float _rotateStartYawDeg = 0.0f;
     uint8_t _stableSamples = 0;
     uint32_t _stableSinceMs = 0;
     uint32_t _motionStartMs = 0;
     uint32_t _motionTimeoutMs = 0;
 
     bool updateImu();
+    float predictedYawDeg() const;
+    float predictedWorldYawDeg() const;
     bool moveBodyRelativeInternal(
         float forwardMm,
         float rightMm,
         float maxRpm,
         float accelerationRpmPerS,
         bool finalHeadingSettle);
+    float prepareTranslationHeading();
+    bool startTranslation(
+        float targetWorldXMm,
+        float targetWorldYMm,
+        float holdWorldYawDeg,
+        float maxRpm,
+        float accelerationRpmPerS,
+        bool finalHeadingSettle,
+        float turnTargetYawDeg = NAN);
+    void startTrackTurn(float alongMm);
+    float configureTrackLimits();
+    float setupTrackSegment(
+        float startWorldXMm,
+        float startWorldYMm,
+        float targetWorldXMm,
+        float targetWorldYMm,
+        float turnTargetYawDeg);
+    uint32_t segmentTimeoutMs(float wheelSteps) const;
+    void updateTrackWheelAcceleration();
+    void startNextTrackSegment();
+    void driveBodyVelocity(
+        float forwardMmPerS,
+        float rightMmPerS,
+        float rotationStepsPerS);
+    void finishTranslation();
     void updateOdometry();
     void updateTranslation();
     void updateRotation();
     void updateStopping();
     bool updateYawSettle(float targetYawDeg, float toleranceDeg);
     void runYawController(float errorDeg);
+    float rotationProfileSpeed(float errorDeg);
+    float slewRotationCommand(float targetSpeed);
+    long rotationSteps() const;
     void resetYawStability();
     void setFault(const char *message);
 

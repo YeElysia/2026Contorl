@@ -148,8 +148,8 @@ namespace vision_config
 
     /*
      * 固定视觉地标居中时，底盘几何中心的实测世界坐标。
-     * 路线中的ROUGH_ANCHOR/STORAGE_ANCHOR仍作为安全进退点；
-     * 对齐成功后先重定位到下列作业点，离站路线会向场地中心撤离。
+     * ROUGH_ANCHOR直接取粗加工区作业点；STORAGE_ANCHOR仍作为进退点。
+     * 对齐成功后重定位到下列作业点。
      */
     constexpr float ROUGH_ALIGNED_WORLD_X_MM = 1220.0F;
     constexpr float ROUGH_ALIGNED_WORLD_Y_MM = 310.0F;

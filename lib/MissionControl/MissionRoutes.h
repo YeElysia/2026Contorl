@@ -2,6 +2,7 @@
 
 #include "RouteExecutor.h"
 #include "field_config.h"
+#include "vision_config.h"
 
 namespace mission_routes
 {
@@ -33,12 +34,25 @@ namespace mission_routes
         return routePreciseMoveTo(point.xMm, point.yMm);
     }
 
+    // 途经点，后面必须紧跟fastTo。
+    constexpr RouteAction throughTo(const FieldPoint &point)
+    {
+        return routeMoveThrough(point.xMm, point.yMm);
+    }
+
+    constexpr RouteAction driftTo(const FieldPose &pose)
+    {
+        return routeMoveToPose(
+            pose.position.xMm,
+            pose.position.yMm,
+            pose.yawDeg);
+    }
+
     /*
      * 区域基准点。
      *
      * 长距离直线使用快速档，脉冲中断按剩余行程自动减速。
-     * 原料区到粗加工区保留最后50mm精确靠近；其他路线直接到工位
-     * 基准点，再由工位视觉修正毫米级误差。
+     * 路线直接到工位基准点，再由工位视觉修正毫米级误差。
      */
     constexpr FieldPose LOWER_HOME_ANCHOR = {
         {field_config::LOWER_RIGHT_START.xMm,
@@ -49,7 +63,11 @@ namespace mission_routes
          field_config::UPPER_RIGHT_START.yMm},
         -180.0F};
     constexpr FieldPose MATERIAL_ANCHOR = {{1200.0F, 2150.0F}, 90.0F};
-    constexpr FieldPose ROUGH_ANCHOR = {{1220.0F, 300.0F}, -90.0F};
+    // 粗加工区直接使用视觉实测作业点，到站和离站都不再产生对准差值。
+    constexpr FieldPose ROUGH_ANCHOR = {
+        {vision_config::ROUGH_ALIGNED_WORLD_X_MM,
+         vision_config::ROUGH_ALIGNED_WORLD_Y_MM},
+        -90.0F};
     constexpr FieldPose STORAGE_ANCHOR = {{2100.0F, 1220.0F}, -180.0F};
 
     // 原料区到粗加工区沿世界-y方向行驶，车头需先转向-180度。
@@ -85,14 +103,10 @@ namespace mission_routes
         STORAGE_ANCHOR.position.xMm,
         MATERIAL_ANCHOR.position.yMm};
 
-    /*
-     * 长距离转场保持在场地轴线上，距工位50 mm处停车。完成作业航向
-     * 旋转后，再用精确档靠近固定点，降低高速停车误差和麦轮横滑。
-     */
-    constexpr float STATION_APPROACH_DISTANCE_MM = 50.0F;
-    constexpr FieldPoint ROUGH_APPROACH = {
+    // 原料区轴线与粗加工区作业点y的交点，界定边走边转的扫掠范围。
+    constexpr FieldPoint ROUGH_AXIS_END = {
         MATERIAL_ANCHOR.position.xMm,
-        ROUGH_ANCHOR.position.yMm + STATION_APPROACH_DISTANCE_MM};
+        ROUGH_ANCHOR.position.yMm};
 
     static_assert(
         field_config::hasRotationClearance(
@@ -104,13 +118,18 @@ namespace mission_routes
         "map corner has insufficient chassis rotation clearance");
 
     /*
-     * 原料区和粗加工区分别保留约100 mm、130 mm的边界余量供整车
-     * 原地旋转；点位调整时禁止把旋转中心移入底盘扫掠边界。
+     * 原料区和粗加工区保留边界余量供整车旋转。原料区到粗加工区边走
+     * 边转，路径落在MATERIAL_ANCHOR、ROUGH_AXIS_END、ROUGH_ANCHOR围成的
+     * 三角形内；余量区域是矩形，三个顶点都满足即整段满足，与转向窗口
+     * 长度无关。
      */
     static_assert(
         field_config::hasRotationClearance(
             MATERIAL_ANCHOR.position.xMm,
             MATERIAL_ANCHOR.position.yMm) &&
+            field_config::hasRotationClearance(
+                ROUGH_AXIS_END.xMm,
+                ROUGH_AXIS_END.yMm) &&
             field_config::hasRotationClearance(
                 ROUGH_ANCHOR.position.xMm,
                 ROUGH_ANCHOR.position.yMm),
@@ -128,40 +147,37 @@ namespace mission_routes
         fastTo(MATERIAL_ANCHOR.position),
     };
 
-    // 原料区先转向，沿x=1200轴线快速直行；转到作业航向后精确靠近。
+    // 原料区原地转-180度后一条指令到粗加工区：沿原料区x轴线快速直行，
+    // 距作业点POSE_MOVE_TURN_WINDOW_MM处边转-90度边并入x偏差，中途不停车。
     constexpr RouteAction MATERIAL_TO_ROUGH[] = {
         fastTo(MATERIAL_ANCHOR.position),
         routeRotateTo(MATERIAL_TO_ROUGH_TRAVEL_YAW_DEG),
-        fastTo(ROUGH_APPROACH),
-        routeRotateTo(ROUGH_ANCHOR.yawDeg),
-        preciseTo(ROUGH_ANCHOR.position),
+        driftTo(ROUGH_ANCHOR),
     };
 
-    // 粗加工区 -> 右下地图角点旋转 -> 暂存区。
+    // 粗加工区 -> 暂存区：进入窗口后边走边转，漂移到位。
     constexpr RouteAction ROUGH_TO_STORAGE[] = {
-        fastTo(ROUGH_STORAGE_CORNER),
-        routeRotateTo(STORAGE_ANCHOR.yawDeg),
-        fastTo(STORAGE_ANCHOR.position),
+        driftTo(STORAGE_ANCHOR),
     };
 
-    // 暂存区 -> 右上地图角点旋转 -> 原料区（第二轮）。
+    // 暂存区 -> 原料区（第二轮）：边走边转，漂移到原料区位姿。
     constexpr RouteAction STORAGE_TO_MATERIAL_SECOND[] = {
-        fastTo(STORAGE_MATERIAL_CORNER),
-        routeRotateTo(MATERIAL_ANCHOR.yawDeg),
-        fastTo(MATERIAL_ANCHOR.position),
+        driftTo(MATERIAL_ANCHOR),
     };
 
-    // 暂存区 -> 右下启停区，保持-180度航向，不在终点旋转。
+    /*
+     * 暂存区 -> 右下启停区，保持-180度航向，一条连续平移：沿中心线
+     * 直行，途经右侧中心线点不停车圆滑拐入启停区。暂存区与中心线
+     * y只差20mm，不再单独经过TURN_CENTER。
+     */
     constexpr RouteAction STORAGE_TO_LOWER_HOME[] = {
-        fastTo(TURN_CENTER),
-        fastTo(HOME_CENTERLINE),
+        throughTo(HOME_CENTERLINE),
         fastTo(LOWER_HOME_ANCHOR.position),
     };
 
-    // 暂存区 -> 右上启停区，与右下路线共用右侧中心线。
+    // 暂存区 -> 右上启停区，与右下路线共用右侧中心线拐点。
     constexpr RouteAction STORAGE_TO_UPPER_HOME[] = {
-        fastTo(TURN_CENTER),
-        fastTo(HOME_CENTERLINE),
+        throughTo(HOME_CENTERLINE),
         fastTo(UPPER_HOME_ANCHOR.position),
     };
 

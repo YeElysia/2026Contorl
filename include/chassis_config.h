@@ -19,7 +19,7 @@ namespace chassis_config
     constexpr uint32_t STEP_TIMER_IRQ_PRIORITY = 2;
     // 单轮最高脉冲频率；至少隔一个tick才能再发脉冲，因此不超过tick的一半。
     constexpr float MAX_STEP_RATE = 50000.0f;
-    // 速度模式（原地旋转/航向静定）超过该时间没有刷新指令，中断自行减速到零。
+    // 速度模式（平移、旋转、航向静定）超过该时间没有刷新指令，中断自行减速到零。
     constexpr uint32_t VELOCITY_WATCHDOG_MS = 100;
 
     // WIT/JY901 IMU 串口。PB12/PB13不启用，避免影响底盘。
@@ -66,14 +66,18 @@ namespace chassis_config
      *
      * 快速档用于长距离转场。脉冲中断按剩余距离自动减速，
      * 因此提高最高转速不会让电机以最高速度撞到目标点。
-     * 450RPM = 48000 steps/s，受MAX_STEP_RATE限制；实际路线峰值约30~38k。
+     * 450RPM = 48000 steps/s，接近MAX_STEP_RATE上限(约468RPM)；
+     * 路线段通常受加速度限制，达不到该转速。
      */
     constexpr float DRIVE_RPM = 450.0f;
 
+    // 快速档加速度
+    constexpr float DRIVE_ACCEL_RPM_PER_S = 320.0f;
     /*
-     * 快速档加速度
+     * 平移加速度从0升到满值（或从满值回到0）的时间，即S曲线的
+     * 加加速度限制，各档位共用。越大起步和刹车越柔和，每段多约此时长。
      */
-    constexpr float DRIVE_ACCEL_RPM_PER_S = 200.0f;
+    constexpr float DRIVE_ACCEL_RAMP_S = 0.15f;
 
     /*
      * 精确档用于工位前20~50 mm进退、最终停车和视觉微调。
@@ -90,17 +94,62 @@ namespace chassis_config
 
     // 基础位置控制已经验证通过，现在启用IMU直行航向保持。
     constexpr bool ENABLE_HEADING_HOLD = true;
-    // 旋转采用PD目标速度，并由软件斜坡真正限制轮速变化率。
-    constexpr float ROTATE_MAX_RPM = 120.0f;
-    constexpr float ROTATE_ACCEL_RPM_PER_S = 300.0f;
+    // 旋转按剩余角度的√曲线给目标速度，并由软件斜坡限制轮速变化率。
+    constexpr float ROTATE_MAX_RPM = 200.0f;
+    constexpr float ROTATE_ACCEL_RPM_PER_S = 450.0f;
     constexpr float HEADING_KP_STEPS_PER_S_PER_DEG = 35.0f;
     constexpr float HEADING_MAX_CORRECTION_RATIO = 0.30f;
-    constexpr float ROTATE_KP_STEPS_PER_S_PER_DEG = 135.0f;
-    constexpr float ROTATE_KD_STEPS_PER_S_PER_DEG_PER_S = 18.0f;
-    constexpr float ROTATE_YAW_RATE_FILTER_ALPHA = 0.35f;
     constexpr float ROTATE_MIN_STEPS_PER_S = 110.0f;
     constexpr float ROTATE_TOLERANCE_DEG = 0.6f;
     constexpr float TRANSLATION_FINAL_HEADING_TOLERANCE_DEG = 0.8f;
+
+    /*
+     * 平移闭环跟踪：每个控制周期按里程位姿计算沿程速度、横偏修正和
+     * 航向修正，再做麦轮逆解下发速度模式。
+     */
+    // 横偏比例增益（mm/s每mm），限幅为路径限速的一定比例。
+    constexpr float TRACK_CROSS_KP_PER_S = 3.0f;
+    constexpr float TRACK_CROSS_MAX_RATIO = 0.20f;
+    // 容差外的最低速度，避免终点和横偏按比例无限逼近。
+    constexpr float TRACK_MIN_SPEED_MM_PER_S = 5.0f;
+    // 实际里程相对S曲线参考位置的比例修正（mm/s每mm）。
+    constexpr float TRACK_POSITION_KP_PER_S = 8.0f;
+    constexpr float TRACK_ALONG_TOLERANCE_MM = 0.5f;
+    constexpr float TRACK_CROSS_TOLERANCE_MM = 1.0f;
+    // 脉冲中断的轮加速度高于路径曲线，给横偏和航向修正留出余量。
+    constexpr float TRACK_WHEEL_ACCEL_MARGIN = 1.5f;
+    /*
+     * 位姿平移（边走边转）的转向窗口：距终点这段距离处开始旋转，
+     * 此后平移进度不超过IMU实测转向进度，目标横偏也只在这段内并入。
+     * 窗口前航向不变，所以它同时是整车旋转扫掠的范围。
+     */
+    constexpr float POSE_MOVE_TURN_WINDOW_MM = 500.0f;
+    /*
+     * 途经点连续平移：第一段参考距途经点还剩这段距离时第二段起步，
+     * 两段S曲线叠加，途经点不停车。直角拐角内切约0.28倍该值
+     * （300mm时约80mm），最低速度约600mm/s。拐角内侧需留出空地。
+     */
+    constexpr float TRACK_BLEND_DISTANCE_MM = 300.0f;
+    /*
+     * 所有旋转(原地、航向静定、位姿平移窗口)按v=√(2·a·ratio·θ)减速，
+     * 减速度取旋转斜坡的一定比例，给力臂估计误差和IMU延迟留余量。
+     */
+    constexpr float ROTATE_DECEL_RATIO = 0.6f;
+    /*
+     * 距目标较近时改为线性减速 v=K·θ（K单位1/s），K·IMU延迟应远小于0.37，
+     * 否则会过冲震荡。K=6时线性段约最后10°。
+     */
+    constexpr float ROTATE_FINAL_GAIN_PER_S = 6.0f;
+    /*
+     * 原地旋转时每度车身转角对应的轮子脉冲，用等效力臂表示，
+     * 用于旋转减速曲线和IMU帧间航向外推。按ROTATE_COMPLETE日志
+     * stepsPerDeg≈68反推（68/(π/180·STEPS_PER_MM)≈191mm）。
+     */
+    constexpr float ROTATION_ARM_MM = 191.0f;
+    constexpr float ROTATION_STEPS_PER_DEG =
+        ROTATION_ARM_MM * PI / 180.0f * STEPS_PER_MM;
+    // 航向参考与当前航向相差超过该值时，放弃参考改为保持当前航向。
+    constexpr float HEADING_REFERENCE_MAX_ERROR_DEG = 3.0f;
     constexpr uint8_t ROTATE_STABLE_SAMPLES = 3;
     constexpr uint32_t ROTATE_STABLE_TIME_MS = 80;
     constexpr uint32_t IMU_STALE_TIMEOUT_MS = 250;

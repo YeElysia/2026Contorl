@@ -5,13 +5,13 @@
 /**
  * @brief 四轮STEP/DIR脉冲发生器，脉冲全部在TIM13定时中断里产生。
  *
- * 主循环只下发目标位置或目标速度，不再负责出脉冲，因此串口、屏幕、
- * 视觉处理造成的循环抖动不会影响轮速。所有接口都会短暂屏蔽本中断
+ * 主循环只下发目标速度，不负责出脉冲，因此串口、屏幕、视觉处理
+ * 造成的循环抖动不会影响脉冲时序。所有接口都会短暂屏蔽本中断
  * （BASEPRI，不影响UART和SysTick），可以在loop()中任意调用。
  *
- * 位置模式：按梯形速度曲线走到目标，巡航速度可在运动中修改。
  * 速度模式：按加速度限制跟随指令速度；超过VELOCITY_WATCHDOG_MS
  * 没有刷新指令时，中断自行减速到零并置看门狗标志。
+ * 位置模式只供stop()沿减速曲线刹停。
  */
 class ChassisStepperDriver
 {
@@ -22,14 +22,6 @@ public:
 
     void begin();
 
-    // 位置模式：从当前位置相对移动steps步。steps为0时原地保持。
-    void moveRelative(
-        uint8_t wheel,
-        long steps,
-        float maxSpeed,
-        float acceleration);
-    // 位置模式下修改巡航速度，超过的部分按加速度减速。
-    void setMaxSpeed(uint8_t wheel, float maxSpeed);
     // 速度模式：四轮同时设置有符号速度，并刷新看门狗。
     void setVelocities(
         const float (&stepsPerSecond)[WHEEL_COUNT],
@@ -40,7 +32,6 @@ public:
     void halt();
 
     void positions(long (&out)[WHEEL_COUNT]) const;
-    long distanceToGo(uint8_t wheel) const;
     bool allStopped() const;
     // 读取并清除速度看门狗标志。
     bool takeWatchdogTrip();

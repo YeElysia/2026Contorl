@@ -71,32 +71,6 @@ void ChassisStepperDriver::begin()
     timer.resume();
 }
 
-void ChassisStepperDriver::moveRelative(
-    uint8_t wheel,
-    long steps,
-    float maxSpeed,
-    float acceleration)
-{
-    if (wheel >= WHEEL_COUNT)
-        return;
-
-    IsrLock lock;
-    Wheel &w = _wheels[wheel];
-    w.target = w.position + static_cast<int32_t>(steps);
-    w.maxSpeed = clampSpeed(fabsf(maxSpeed));
-    w.acceleration = fabsf(acceleration);
-    w.mode = Mode::Position;
-}
-
-void ChassisStepperDriver::setMaxSpeed(uint8_t wheel, float maxSpeed)
-{
-    if (wheel >= WHEEL_COUNT)
-        return;
-
-    IsrLock lock;
-    _wheels[wheel].maxSpeed = clampSpeed(fabsf(maxSpeed));
-}
-
 void ChassisStepperDriver::setVelocities(
     const float (&stepsPerSecond)[WHEEL_COUNT],
     float acceleration)
@@ -159,16 +133,6 @@ void ChassisStepperDriver::positions(long (&out)[WHEEL_COUNT]) const
     IsrLock lock;
     for (uint8_t i = 0; i < WHEEL_COUNT; ++i)
         out[i] = _wheels[i].position;
-}
-
-long ChassisStepperDriver::distanceToGo(uint8_t wheel) const
-{
-    if (wheel >= WHEEL_COUNT)
-        return 0;
-
-    IsrLock lock;
-    const Wheel &w = _wheels[wheel];
-    return w.mode == Mode::Position ? w.target - w.position : 0;
 }
 
 bool ChassisStepperDriver::allStopped() const

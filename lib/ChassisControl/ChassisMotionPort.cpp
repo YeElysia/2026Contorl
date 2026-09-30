@@ -24,6 +24,40 @@ bool ChassisMotionPort::moveWorldTo(
                accelerationRpmPerS);
 }
 
+bool ChassisMotionPort::moveWorldThrough(
+    float viaWorldXMm,
+    float viaWorldYMm,
+    float targetWorldXMm,
+    float targetWorldYMm,
+    float maxRpm,
+    float accelerationRpmPerS)
+{
+    return acquire() &&
+           _chassis.moveWorldThrough(
+               viaWorldXMm,
+               viaWorldYMm,
+               targetWorldXMm,
+               targetWorldYMm,
+               maxRpm,
+               accelerationRpmPerS);
+}
+
+bool ChassisMotionPort::moveWorldToPose(
+    float targetWorldXMm,
+    float targetWorldYMm,
+    float worldYawDeg,
+    float maxRpm,
+    float accelerationRpmPerS)
+{
+    return acquire() &&
+           _chassis.moveWorldToPose(
+               targetWorldXMm,
+               targetWorldYMm,
+               worldYawDeg,
+               maxRpm,
+               accelerationRpmPerS);
+}
+
 bool ChassisMotionPort::rotateWorldTo(float worldYawDeg)
 {
     return acquire() && _chassis.rotateWorldTo(worldYawDeg);

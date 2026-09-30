@@ -50,36 +50,55 @@ void RouteExecutor::update()
     const RouteAction &action = _actions[_index];
     bool accepted = false;
 
+    const bool precise = action.profile == MotionProfile::Precise;
+    const float maximumRpm =
+        precise ? chassis_config::PRECISE_DRIVE_RPM
+                : chassis_config::DRIVE_RPM;
+    const float accelerationRpmPerS =
+        precise ? chassis_config::PRECISE_DRIVE_ACCEL_RPM_PER_S
+                : chassis_config::DRIVE_ACCEL_RPM_PER_S;
+
     switch (action.type)
     {
     case RouteActionType::MoveTo:
-    {
-        float maximumRpm = chassis_config::DRIVE_RPM;
-        float accelerationRpmPerS =
-            chassis_config::DRIVE_ACCEL_RPM_PER_S;
-
-        if (action.profile == MotionProfile::Precise)
-        {
-            maximumRpm = chassis_config::PRECISE_DRIVE_RPM;
-            accelerationRpmPerS =
-                chassis_config::PRECISE_DRIVE_ACCEL_RPM_PER_S;
-        }
-
         accepted = _chassis.moveWorldTo(
             action.xMm,
             action.yMm,
             maximumRpm,
             accelerationRpmPerS);
         break;
-    }
+
+    case RouteActionType::MoveThrough:
+        if (_index + 1 < _count &&
+            _actions[_index + 1].type == RouteActionType::MoveTo)
+        {
+            const RouteAction &next = _actions[_index + 1];
+            accepted = _chassis.moveWorldThrough(
+                action.xMm,
+                action.yMm,
+                next.xMm,
+                next.yMm,
+                maximumRpm,
+                accelerationRpmPerS);
+        }
+        break;
 
     case RouteActionType::RotateTo:
         accepted = _chassis.rotateWorldTo(action.yawDeg);
         break;
+
+    case RouteActionType::MoveToPose:
+        accepted = _chassis.moveWorldToPose(
+            action.xMm,
+            action.yMm,
+            action.yawDeg,
+            maximumRpm,
+            accelerationRpmPerS);
+        break;
     }
 
     if (accepted)
-        ++_index;
+        _index += action.type == RouteActionType::MoveThrough ? 2 : 1;
     else
         finish(AsyncResult::Failed);
 }

@@ -138,7 +138,7 @@ namespace mechanism_config
     // 实车收纳位置：伸缩轴在1500时完全收回。
     constexpr float EXTENSION_HOME = 1500.0F;
     // 从载物盘取放物料时的伸缩位置。
-    constexpr float EXTENSION_TRAY_TRANSFER = 1485.0F;
+    constexpr float EXTENSION_TRAY_TRANSFER = 1600.0F;
     constexpr float EXTENSION_TURNTABLE = 1450.0F;
 
     // 工位动作完成后，底座转到180°车内收纳方向。

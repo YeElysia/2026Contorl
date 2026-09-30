@@ -2,6 +2,7 @@
 
 #include "ChassisEmm42TtlFeedback.h"
 #include "DebugLog.h"
+#include "ChassisTracking.h"
 #include "chassis_config.h"
 #include <math.h>
 #include <string.h>
@@ -124,101 +125,279 @@ bool ChassisControl::moveBodyRelativeInternal(
         return false;
     if (!isfinite(forwardMm) ||
         !isfinite(rightMm) ||
-        !isfinite(maxRpm) ||
-        !isfinite(accelerationRpmPerS) ||
-        maxRpm <= 0.0f ||
-        accelerationRpmPerS <= 0.0f ||
         fabsf(forwardMm) > MAX_SINGLE_MOVE_COMPONENT_MM ||
         fabsf(rightMm) > MAX_SINGLE_MOVE_COMPONENT_MM)
         return false;
 
-    /*
-     * 四麦轮平移逆运动学。
-     *
-     * 电机顺序：左前、右前、左后、右后。
-     * 此处先计算每个轮子的等效行程，随后再通过 MOTOR_SIGN
-     * 适配各电机的实际安装方向：
-     *
-     *   左前 = 前进 + 右移
-     *   右前 = 前进 - 右移
-     *   左后 = 前进 - 右移
-     *   右后 = 前进 + 右移
-     */
-    const float calibratedForwardMm =
-        forwardMm * distanceScale(
-                        forwardMm,
-                        FORWARD_DISTANCE_SCALE,
-                        BACKWARD_DISTANCE_SCALE);
-    const float calibratedRightMm =
-        rightMm * distanceScale(
-                      rightMm,
-                      RIGHT_DISTANCE_SCALE,
-                      LEFT_DISTANCE_SCALE);
-    const float wheelMm[4] = {
-        calibratedForwardMm + calibratedRightMm,
-        calibratedForwardMm - calibratedRightMm,
-        calibratedForwardMm - calibratedRightMm,
-        calibratedForwardMm + calibratedRightMm};
+    // 车体方向按锁定航向换算，视觉和抓取给出的前后/左右不随残余偏航歪斜。
+    const float holdWorldYawDeg = prepareTranslationHeading();
+    float worldXMm = 0.0F;
+    float worldYMm = 0.0F;
+    bodyToWorld(
+        forwardMm,
+        rightMm,
+        holdWorldYawDeg,
+        worldXMm,
+        worldYMm);
+    return startTranslation(
+        _worldPose.xMm + worldXMm,
+        _worldPose.yMm + worldYMm,
+        holdWorldYawDeg,
+        maxRpm,
+        accelerationRpmPerS,
+        finalHeadingSettle);
+}
 
-    bool hasMotion = false;
-    long wheelPulses[4] = {};
-    long maximumPulses = 0;
-    for (uint8_t i = 0; i < 4; ++i)
-    {
-        wheelPulses[i] =
-            lroundf(wheelMm[i] * STEPS_PER_MM) * MOTOR_SIGN[i];
-        maximumPulses = max(maximumPulses, labs(wheelPulses[i]));
-        hasMotion = hasMotion || wheelPulses[i] != 0;
-    }
-    if (!hasMotion)
-        return true;
-
-    /*
-     * 按行程比例同步四轮的速度和加速度。
-     *
-     * 若 d[i] = ratio[i] * dMax，同时设置
-     * v[i] = ratio[i] * vMax、a[i] = ratio[i] * aMax，
-     * 四个轮子的加速、匀速和减速阶段会使用相同时间，因此同时到位。
-     */
-    const float maximumSpeed = rpmToStepsPerSecond(maxRpm);
-    const float maximumAcceleration =
-        rpmToStepsPerSecond(accelerationRpmPerS);
-    _activeTranslationMaximumSpeed = maximumSpeed;
-    for (uint8_t i = 0; i < 4; ++i)
-    {
-        const float ratio =
-            static_cast<float>(labs(wheelPulses[i])) /
-            static_cast<float>(maximumPulses);
-        _translationSpeed[i] = maximumSpeed * ratio;
-
-        // 45°斜移时可能有两个轮子理论行程为零，此时原地保持。
-        _driver.moveRelative(
-            i,
-            wheelPulses[i],
-            _translationSpeed[i],
-            maximumAcceleration * ratio);
-    }
-
-    // 记录起步航向。updateTranslation() 会在整个移动期间保持该角度。
-    _holdYawDeg = _yawDeg;
+float ChassisControl::prepareTranslationHeading()
+{
     _translationHeadingEnabled =
         ENABLE_HEADING_HOLD && imuReady();
-    _translationFinalHeadingSettleEnabled =
-        finalHeadingSettle;
+    if (!_translationHeadingEnabled)
+        return _worldPose.yawDeg;
+
+    const float referenceErrorDeg =
+        wrap180(_headingReferenceDeg - _yawDeg);
+    if (!_headingReferenceValid ||
+        fabsf(referenceErrorDeg) > HEADING_REFERENCE_MAX_ERROR_DEG)
+    {
+        if (_headingReferenceValid)
+        {
+            LOGF_WARNING("Chassis", "HEADING_REFERENCE_RESET ref=%.1f° yaw=%.1f°",
+                         _headingReferenceDeg, _yawDeg);
+        }
+        _headingReferenceDeg = _yawDeg;
+        _headingReferenceValid = true;
+    }
+
+    _holdYawDeg = _headingReferenceDeg;
+    return wrap180(_holdYawDeg - _worldYawOffsetDeg);
+}
+
+bool ChassisControl::startTranslation(
+    float targetWorldXMm,
+    float targetWorldYMm,
+    float holdWorldYawDeg,
+    float maxRpm,
+    float accelerationRpmPerS,
+    bool finalHeadingSettle,
+    float turnTargetYawDeg)
+{
+    if (!isfinite(targetWorldXMm) ||
+        !isfinite(targetWorldYMm) ||
+        !isfinite(maxRpm) ||
+        !isfinite(accelerationRpmPerS) ||
+        maxRpm <= 0.0f ||
+        accelerationRpmPerS <= 0.0f)
+        return false;
+
+    const float deltaXMm = targetWorldXMm - _worldPose.xMm;
+    const float deltaYMm = targetWorldYMm - _worldPose.yMm;
+    const float lengthMm =
+        sqrtf(deltaXMm * deltaXMm + deltaYMm * deltaYMm);
+    if (lengthMm * STEPS_PER_MM < 0.5F)
+        return true;
+
+    _trackHoldWorldYawDeg = holdWorldYawDeg;
+    _trackMaxRpm = maxRpm;
+    _trackAccelerationRpmPerS = accelerationRpmPerS;
+    _trackNextPending = false;
+    _trackBlendActive = false;
+    _trackAlongSpeedMm = 0.0F;
+    const float wheelSteps = setupTrackSegment(
+        _worldPose.xMm,
+        _worldPose.yMm,
+        targetWorldXMm,
+        targetWorldYMm,
+        turnTargetYawDeg);
+    _trackLastControlUs = micros();
+
+    _translationFinalHeadingSettleEnabled = finalHeadingSettle;
     _translationPhase = TranslationPhase::Driving;
     resetYawStability();
     _motionStartMs = millis();
-    _motionTimeoutMs = estimateTranslationTimeoutMs(
-        maximumPulses,
-        maximumSpeed,
-        maximumAcceleration);
+    _motionTimeoutMs = segmentTimeoutMs(wheelSteps);
     _state = State::Translating;
-    
-    // 记录日志
-    LOGF_INFO("Chassis", "MOVE_START forward=%.1fmm right=%.1fmm yaw=%.1f° speed=%.0fRPM", 
-              forwardMm, rightMm, _holdYawDeg, maxRpm);
-    
+
+    LOGF_INFO("Chassis", "MOVE_START from=(%.1f,%.1f) to=(%.1f,%.1f) hold=%.1f° turn=%.1f° window=%.0fmm speed=%.0fRPM",
+              _trackStartXMm, _trackStartYMm,
+              _trackTargetXMm, _trackTargetYMm,
+              holdWorldYawDeg,
+              _trackYawReached ? 0.0F : _trackYawTotalDeg,
+              _trackTurnWindowMm, maxRpm);
     return true;
+}
+
+float ChassisControl::configureTrackLimits()
+{
+    /*
+     * maxRpm限制的是轮速。路径方向在车体系中的分量决定每走1mm路径
+     * 最快的轮子要走多少mm（斜移时为|f|+|r|），据此换算路径限速，
+     * 使最大轮速和轮加速度仍等于路线档位参数。位姿平移的行进轴是
+     * 车体轴；窗口内转向时速度已降低，超限由逆解等比缩放兜底。
+     */
+    float directionForward = 0.0F;
+    float directionRight = 0.0F;
+    worldToBody(
+        _trackDirectionX,
+        _trackDirectionY,
+        _trackHoldWorldYawDeg,
+        directionForward,
+        directionRight);
+    const float wheelMmPerPathMm =
+        fabsf(directionForward) *
+            distanceScale(
+                directionForward,
+                FORWARD_DISTANCE_SCALE,
+                BACKWARD_DISTANCE_SCALE) +
+        fabsf(directionRight) *
+            distanceScale(
+                directionRight,
+                RIGHT_DISTANCE_SCALE,
+                LEFT_DISTANCE_SCALE);
+    const float wheelStepsPerPathMm =
+        STEPS_PER_MM * wheelMmPerPathMm;
+    const float maximumWheelSpeed = rpmToStepsPerSecond(_trackMaxRpm);
+    const float wheelAcceleration =
+        rpmToStepsPerSecond(_trackAccelerationRpmPerS);
+
+    _trackMaximumSpeedMm = maximumWheelSpeed / wheelStepsPerPathMm;
+    _trackAccelerationMm = wheelAcceleration / wheelStepsPerPathMm;
+    _trackJerkMm = _trackAccelerationMm / DRIVE_ACCEL_RAMP_S;
+    _trackMaximumWheelSpeed = maximumWheelSpeed;
+    updateTrackWheelAcceleration();
+    return wheelStepsPerPathMm;
+}
+
+float ChassisControl::setupTrackSegment(
+    float startWorldXMm,
+    float startWorldYMm,
+    float targetWorldXMm,
+    float targetWorldYMm,
+    float turnTargetYawDeg)
+{
+    const float deltaXMm = targetWorldXMm - startWorldXMm;
+    const float deltaYMm = targetWorldYMm - startWorldYMm;
+    const float lengthMm =
+        sqrtf(deltaXMm * deltaXMm + deltaYMm * deltaYMm);
+
+    float directionX = deltaXMm / lengthMm;
+    float directionY = deltaYMm / lengthMm;
+    const bool poseMove = isfinite(turnTargetYawDeg);
+    if (poseMove)
+    {
+        // 行进轴取起步航向下最接近目标方向的车体轴。
+        float forwardX = 0.0F;
+        float forwardY = 0.0F;
+        float rightX = 0.0F;
+        float rightY = 0.0F;
+        bodyToWorld(1.0F, 0.0F, _trackHoldWorldYawDeg, forwardX, forwardY);
+        bodyToWorld(0.0F, 1.0F, _trackHoldWorldYawDeg, rightX, rightY);
+        const float forwardDot = forwardX * deltaXMm + forwardY * deltaYMm;
+        const float rightDot = rightX * deltaXMm + rightY * deltaYMm;
+        const bool useForward = fabsf(forwardDot) >= fabsf(rightDot);
+        const float sign = copysignf(
+            1.0F,
+            useForward ? forwardDot : rightDot);
+        directionX = sign * (useForward ? forwardX : rightX);
+        directionY = sign * (useForward ? forwardY : rightY);
+    }
+    const float alongLengthMm =
+        deltaXMm * directionX + deltaYMm * directionY;
+
+    _trackStartXMm = startWorldXMm;
+    _trackStartYMm = startWorldYMm;
+    _trackTargetXMm = targetWorldXMm;
+    _trackTargetYMm = targetWorldYMm;
+    _trackDirectionX = directionX;
+    _trackDirectionY = directionY;
+    _trackTargetCrossMm = directionX * deltaYMm - directionY * deltaXMm;
+    _trackTurnWindowMm =
+        poseMove ? min(POSE_MOVE_TURN_WINDOW_MM, alongLengthMm) : 0.0F;
+    _trackTargetYawDeg = poseMove ? turnTargetYawDeg : _holdYawDeg;
+    _trackYawTotalDeg =
+        fabsf(wrap180(_trackTargetYawDeg - _holdYawDeg));
+    _trackTurnStarted = false;
+    _trackYawReached = _trackYawTotalDeg <= ROTATE_TOLERANCE_DEG;
+    if (_trackYawReached)
+        _holdYawDeg = _trackTargetYawDeg;
+
+    // 进度沿行进轴计，与pathError的along一致；横偏在窗口内另行并入。
+    _trackLengthMm = alongLengthMm;
+    _trackProfile = {};
+    return configureTrackLimits() * lengthMm;
+}
+
+uint32_t ChassisControl::segmentTimeoutMs(float wheelSteps) const
+{
+    uint32_t timeoutMs = estimateTranslationTimeoutMs(
+        lroundf(wheelSteps),
+        _trackMaximumWheelSpeed,
+        rpmToStepsPerSecond(_trackAccelerationRpmPerS));
+    if (!_trackYawReached)
+        timeoutMs += estimateRotationTimeoutMs(_trackYawTotalDeg);
+    return min(timeoutMs, MOTION_TIMEOUT_MAX_MS);
+}
+
+void ChassisControl::updateTrackWheelAcceleration()
+{
+    float acceleration =
+        rpmToStepsPerSecond(_trackAccelerationRpmPerS) *
+        TRACK_WHEEL_ACCEL_MARGIN;
+    // 两段加减速同时作用，拐角处换向的一对轮子需要两倍斜坡。
+    if (_trackBlendActive)
+        acceleration *= 2.0F;
+    // 转向中车体系行进方向在变（斜向轮速为|f|+|r|≤√2倍），且叠加旋转斜坡。
+    if (_trackTurnStarted)
+    {
+        acceleration =
+            acceleration * sqrtf(2.0F) +
+            rpmToStepsPerSecond(ROTATE_ACCEL_RPM_PER_S);
+    }
+    _trackWheelAcceleration = acceleration;
+}
+
+void ChassisControl::startNextTrackSegment()
+{
+    _trackNextPending = false;
+    _trackBlendActive = true;
+    _trackBlendDirectionX = _trackDirectionX;
+    _trackBlendDirectionY = _trackDirectionY;
+    _trackBlendLengthMm = _trackLengthMm;
+    _trackBlendMaximumSpeedMm = _trackMaximumSpeedMm;
+    _trackBlendAccelerationMm = _trackAccelerationMm;
+    _trackBlendJerkMm = _trackJerkMm;
+    _trackBlendProfile = _trackProfile;
+
+    const float wheelSteps = setupTrackSegment(
+        _trackTargetXMm,
+        _trackTargetYMm,
+        _trackNextTargetXMm,
+        _trackNextTargetYMm,
+        _trackNextYawDeg);
+
+    const uint32_t elapsedMs = millis() - _motionStartMs;
+    _motionTimeoutMs = min(
+        max(_motionTimeoutMs, elapsedMs + segmentTimeoutMs(wheelSteps)),
+        MOTION_TIMEOUT_MAX_MS);
+
+    LOGF_INFO("Chassis", "MOVE_BLEND_START pose=(%.1f,%.1f) via=(%.1f,%.1f) to=(%.1f,%.1f) speed=%.0fmm/s turn=%.1f° window=%.0fmm",
+              _worldPose.xMm, _worldPose.yMm,
+              _trackStartXMm, _trackStartYMm,
+              _trackTargetXMm, _trackTargetYMm,
+              _trackBlendProfile.velocity,
+              _trackYawReached ? 0.0F : _trackYawTotalDeg,
+              _trackTurnWindowMm);
+}
+
+void ChassisControl::startTrackTurn(float alongMm)
+{
+    _trackTurnStarted = true;
+    _holdYawDeg = _trackTargetYawDeg;
+    // 旋转从零速斜坡起步，与rotateTo一致。
+    resetYawStability();
+    updateTrackWheelAcceleration();
+    LOGF_INFO("Chassis", "MOVE_TURN_START along=%.1fmm speed=%.0fmm/s yaw=%.1f° target=%.1f°",
+              alongMm, _trackAlongSpeedMm, _yawDeg, _trackTargetYawDeg);
 }
 
 bool ChassisControl::moveRelative(
@@ -245,24 +424,22 @@ bool ChassisControl::moveWorldRelative(
         setFault("world move rejected: pose yaw not ready");
         return false;
     }
+    if (busy() || _state == State::Fault)
+        return false;
+    if (!isfinite(worldXMm) ||
+        !isfinite(worldYMm) ||
+        fabsf(worldXMm) > MAX_SINGLE_MOVE_COMPONENT_MM ||
+        fabsf(worldYMm) > MAX_SINGLE_MOVE_COMPONENT_MM)
+        return false;
 
-    float forwardMm = 0.0F;
-    float rightMm = 0.0F;
-    worldToBody(
-        worldXMm,
-        worldYMm,
-        _worldPose.yawDeg,
-        forwardMm,
-        rightMm);
-    
-    LOGF_DEBUG("Chassis", "WORLD_MOVE world=(%.1f,%.1f) body=(%.1f,%.1f) yaw=%.1f°",
-               worldXMm, worldYMm, forwardMm, rightMm, _worldPose.yawDeg);
-    
-    return moveBodyRelative(
-        forwardMm,
-        rightMm,
+    const float holdWorldYawDeg = prepareTranslationHeading();
+    return startTranslation(
+        _worldPose.xMm + worldXMm,
+        _worldPose.yMm + worldYMm,
+        holdWorldYawDeg,
         maxRpm,
-        accelerationRpmPerS);
+        accelerationRpmPerS,
+        true);
 }
 
 bool ChassisControl::moveWorldTo(
@@ -278,6 +455,104 @@ bool ChassisControl::moveWorldTo(
         accelerationRpmPerS);
 }
 
+bool ChassisControl::moveWorldThrough(
+    float viaWorldXMm,
+    float viaWorldYMm,
+    float targetWorldXMm,
+    float targetWorldYMm,
+    float maxRpm,
+    float accelerationRpmPerS)
+{
+    const float nextXMm = targetWorldXMm - viaWorldXMm;
+    const float nextYMm = targetWorldYMm - viaWorldYMm;
+    if (!isfinite(nextXMm) ||
+        !isfinite(nextYMm) ||
+        fabsf(nextXMm) > MAX_SINGLE_MOVE_COMPONENT_MM ||
+        fabsf(nextYMm) > MAX_SINGLE_MOVE_COMPONENT_MM)
+        return false;
+
+    if (!moveWorldTo(
+            viaWorldXMm,
+            viaWorldYMm,
+            maxRpm,
+            accelerationRpmPerS))
+        return false;
+
+    // 已在途经点上时第一段不会启动，直接走第二段。
+    if (_state != State::Translating)
+    {
+        return moveWorldTo(
+            targetWorldXMm,
+            targetWorldYMm,
+            maxRpm,
+            accelerationRpmPerS);
+    }
+
+    const float nextLengthMm =
+        sqrtf(nextXMm * nextXMm + nextYMm * nextYMm);
+    if (nextLengthMm * STEPS_PER_MM < 0.5F)
+        return true;
+
+    _trackNextPending = true;
+    _trackNextTargetXMm = targetWorldXMm;
+    _trackNextTargetYMm = targetWorldYMm;
+    _trackNextYawDeg = NAN;
+    _trackBlendMm = min(
+        TRACK_BLEND_DISTANCE_MM,
+        0.5F * min(_trackLengthMm, nextLengthMm));
+    return true;
+}
+
+bool ChassisControl::moveWorldToPose(
+    float targetWorldXMm,
+    float targetWorldYMm,
+    float worldYawDeg,
+    float maxRpm,
+    float accelerationRpmPerS)
+{
+    if (!_worldYawOffsetReady || !imuReady())
+    {
+        setFault("pose move rejected: IMU yaw not ready");
+        return false;
+    }
+    if (busy() || _state == State::Fault)
+        return false;
+
+    const float deltaXMm = targetWorldXMm - _worldPose.xMm;
+    const float deltaYMm = targetWorldYMm - _worldPose.yMm;
+    if (!isfinite(deltaXMm) ||
+        !isfinite(deltaYMm) ||
+        !isfinite(worldYawDeg) ||
+        fabsf(deltaXMm) > MAX_SINGLE_MOVE_COMPONENT_MM ||
+        fabsf(deltaYMm) > MAX_SINGLE_MOVE_COMPONENT_MM)
+        return false;
+
+    const float targetYawDeg =
+        wrap180(worldYawDeg + _worldYawOffsetDeg);
+    if (sqrtf(deltaXMm * deltaXMm + deltaYMm * deltaYMm) *
+            STEPS_PER_MM <
+        0.5F)
+        return rotateTo(targetYawDeg);
+
+    // 转向前的直线保持起步航向，与普通平移取同一航向参考。
+    const float holdWorldYawDeg = prepareTranslationHeading();
+    if (!_translationHeadingEnabled)
+        _holdYawDeg = _yawDeg;
+    _translationHeadingEnabled = true;
+    // 与rotateTo一致：转向目标成为后续平移的航向参考。
+    _headingReferenceDeg = targetYawDeg;
+    _headingReferenceValid = true;
+
+    return startTranslation(
+        targetWorldXMm,
+        targetWorldYMm,
+        holdWorldYawDeg,
+        maxRpm,
+        accelerationRpmPerS,
+        true,
+        targetYawDeg);
+}
+
 bool ChassisControl::rotateTo(float absoluteYawDeg)
 {
     if (busy() || _state == State::Fault)
@@ -291,6 +566,10 @@ bool ChassisControl::rotateTo(float absoluteYawDeg)
     }
 
     _rotateTargetDeg = wrap180(absoluteYawDeg);
+    _rotateStartSteps = rotationSteps();
+    _rotateStartYawDeg = _yawDeg;
+    _headingReferenceDeg = _rotateTargetDeg;
+    _headingReferenceValid = true;
     resetYawStability();
     _motionStartMs = millis();
     _motionTimeoutMs = estimateRotationTimeoutMs(
@@ -394,6 +673,8 @@ bool ChassisControl::resetWorldPose(
             wrap180(_yawDeg - _worldPose.yawDeg);
         _worldYawReady = true;
         _worldYawOffsetReady = true;
+        _headingReferenceDeg = _yawDeg;
+        _headingReferenceValid = true;
     }
     else
     {
@@ -507,10 +788,17 @@ bool ChassisControl::updateImu()
                 static_cast<int16_t>(
                     static_cast<uint16_t>(_imuFrame[6]) |
                     (static_cast<uint16_t>(_imuFrame[7]) << 8));
-            _yawDeg = rawYaw / 32768.0f * 180.0f;
+            const float yawDeg = rawYaw / 32768.0f * 180.0f;
+            _imuFrameRotationSteps = rotationSteps();
+            _yawDeg = yawDeg;
             _lastImuMs = millis();
             _imuReady = true;
             ++_imuSequence;
+            if (!_headingReferenceValid)
+            {
+                _headingReferenceDeg = _yawDeg;
+                _headingReferenceValid = true;
+            }
             if (!_worldYawOffsetReady)
             {
                 _worldYawOffsetDeg =
@@ -576,11 +864,29 @@ void ChassisControl::updateOdometry()
     bodyToWorld(
         forwardMm,
         rightMm,
-        _worldPose.yawDeg,
+        predictedWorldYawDeg(),
         worldXMm,
         worldYMm);
     _worldPose.xMm += worldXMm;
     _worldPose.yMm += worldYMm;
+}
+
+float ChassisControl::predictedYawDeg() const
+{
+    // 帧间用旋转脉冲外推：脉冲无延迟，不受IMU帧率和角速度估计噪声影响。
+    if (!_imuReady)
+        return _yawDeg;
+    return wrap180(
+        _yawDeg +
+        static_cast<float>(rotationSteps() - _imuFrameRotationSteps) /
+            ROTATION_STEPS_PER_DEG);
+}
+
+float ChassisControl::predictedWorldYawDeg() const
+{
+    if (!_imuReady)
+        return _worldPose.yawDeg;
+    return wrap180(predictedYawDeg() - _worldYawOffsetDeg);
 }
 
 void ChassisControl::updateTranslation()
@@ -591,80 +897,288 @@ void ChassisControl::updateTranslation()
         return;
     }
 
-    if (_translationPhase == TranslationPhase::HeadingSettling)
+    switch (_translationPhase)
     {
+    case TranslationPhase::HeadingSettling:
         if (updateYawSettle(
                 _holdYawDeg,
                 TRANSLATION_FINAL_HEADING_TOLERANCE_DEG))
         {
             _state = State::Idle;
             LOGF_INFO("Chassis", "MOVE_COMPLETE pose=(%.1f, %.1f, %.1f°) duration=%lums",
-                      _worldPose.xMm, _worldPose.yMm, _worldPose.yawDeg, 
+                      _worldPose.xMm, _worldPose.yMm, _worldPose.yawDeg,
                       millis() - _motionStartMs);
         }
         return;
-    }
 
-    float correction = 0.0f;
-    if (_translationHeadingEnabled)
-    {
-        const float error = wrap180(_holdYawDeg - _yawDeg);
-        float maxCorrection =
-            _activeTranslationMaximumSpeed *
-            HEADING_MAX_CORRECTION_RATIO;
-
-        /*
-         * 修正量不能大于任一运动轮的主要平移速度，否则短行程轮
-         * 可能被要求反转，而 run() 的目标位置控制无法执行这种反转。
-         */
-        for (uint8_t i = 0; i < 4; ++i)
+    case TranslationPhase::Braking:
+        // 零速也要每周期刷新，否则速度看门狗会判定主循环卡死。
+        driveBodyVelocity(0.0F, 0.0F, 0.0F);
+        if (_driver.allStopped())
         {
-            if (_driver.distanceToGo(i) != 0)
-                maxCorrection =
-                    min(maxCorrection, _translationSpeed[i] * 0.8f);
+            _driver.halt();
+            finishTranslation();
         }
+        return;
 
-        correction = constrain(
-            error * HEADING_KP_STEPS_PER_S_PER_DEG,
-            -maxCorrection, maxCorrection);
+    case TranslationPhase::Driving:
+        break;
     }
 
-    // 同号的有符号轮速修正产生原地旋转，不改变主要平移组合。
-    // 位置模式由剩余行程决定方向，因此这里根据
-    // distanceToGo() 的符号把修正量换算成各轮速度幅值。
+    using namespace chassis_tracking;
+
+    const uint32_t nowUs = micros();
+    const float elapsedSeconds = min(
+        static_cast<float>(nowUs - _trackLastControlUs) * 1.0e-6F,
+        0.05F);
+    _trackLastControlUs = nowUs;
+
+    if (_trackNextPending &&
+        _trackLengthMm - _trackProfile.position <= _trackBlendMm)
+    {
+        startNextTrackSegment();
+    }
+
+    const Vec2 direction = {_trackDirectionX, _trackDirectionY};
+    const PathError error = pathError(
+        {_trackStartXMm, _trackStartYMm},
+        direction,
+        {_trackTargetXMm, _trackTargetYMm},
+        {_worldPose.xMm, _worldPose.yMm});
+
+    const float targetYawErrorDeg =
+        wrap180(_trackTargetYawDeg - _yawDeg);
+    if (!_trackYawReached)
+    {
+        // 窗口前按到终点的正常曲线行驶，进入窗口才起转。
+        if (!_trackTurnStarted &&
+            error.along <= _trackTurnWindowMm)
+        {
+            startTrackTurn(error.along);
+        }
+        if (_trackTurnStarted &&
+            fabsf(targetYawErrorDeg) <= ROTATE_TOLERANCE_DEG)
+        {
+            _trackYawReached = true;
+        }
+    }
+
+    // 横偏参考在窗口内从0线性过渡到目标横偏，窗口外保持纯轴向运动。
+    float crossReferenceMm = 0.0F;
+    float crossFeedforwardMm = 0.0F;
+    if (_trackTurnWindowMm > 0.0F)
+    {
+        const float windowRatio = constrain(
+            error.along / _trackTurnWindowMm,
+            0.0F,
+            1.0F);
+        crossReferenceMm = _trackTargetCrossMm * (1.0F - windowRatio);
+        if (windowRatio > 0.0F && windowRatio < 1.0F)
+        {
+            crossFeedforwardMm =
+                _trackTargetCrossMm / _trackTurnWindowMm *
+                _trackAlongSpeedMm;
+        }
+    }
+    /*
+     * 上一段参考在途经点前还剩r=-u1·(L1-s1)，速度u1·v1；投影到当前段
+     * 的沿程和横偏上叠加，两段合成的参考轨迹连续、圆滑内切拐角。
+     */
+    float blendAlongMm = 0.0F;
+    float blendAlongSpeedMm = 0.0F;
+    if (_trackBlendActive)
+    {
+        jerkStep(
+            _trackBlendProfile,
+            _trackBlendLengthMm,
+            _trackBlendMaximumSpeedMm,
+            _trackBlendAccelerationMm,
+            _trackBlendJerkMm,
+            elapsedSeconds);
+        const float alongDot =
+            _trackBlendDirectionX * direction.x +
+            _trackBlendDirectionY * direction.y;
+        const float crossDot =
+            direction.x * _trackBlendDirectionY -
+            direction.y * _trackBlendDirectionX;
+        const float blendRemainingMm =
+            _trackBlendLengthMm - _trackBlendProfile.position;
+        blendAlongMm = -blendRemainingMm * alongDot;
+        blendAlongSpeedMm = _trackBlendProfile.velocity * alongDot;
+        crossReferenceMm -= blendRemainingMm * crossDot;
+        crossFeedforwardMm += _trackBlendProfile.velocity * crossDot;
+        if (jerkFinished(_trackBlendProfile, _trackBlendLengthMm))
+        {
+            _trackBlendActive = false;
+            updateTrackWheelAcceleration();
+        }
+    }
+    const float crossErrorMm = error.cross - crossReferenceMm;
+
+    if (!_trackNextPending &&
+        !_trackBlendActive &&
+        _trackYawReached &&
+        fabsf(error.along) <= TRACK_ALONG_TOLERANCE_MM &&
+        fabsf(crossErrorMm) <= TRACK_CROSS_TOLERANCE_MM)
+    {
+        _trackAlongSpeedMm = 0.0F;
+        _translationPhase = TranslationPhase::Braking;
+        driveBodyVelocity(0.0F, 0.0F, 0.0F);
+        return;
+    }
+
+    // 转向中平移只允许跟到实测转向进度，终点前一定先转到位。
+    const float remainingMm =
+        !_trackTurnStarted || _trackYawReached
+            ? error.along
+            : yawGatedRemaining(
+                  error.along,
+                  _trackTurnWindowMm,
+                  targetYawErrorDeg,
+                  _trackYawTotalDeg);
+    /*
+     * 发生器沿路径生成加加速度受限的参考，终点为有效剩余距离对应的
+     * 进度。里程由脉冲计数得到，参考与实际之差很小，比例修正只消除
+     * 累积误差；参考停止后由同一修正加最低速度收尾到容差内。
+     */
+    const float progressMm = _trackLengthMm - error.along;
+    // 普通平移remaining==along，goal恰为全长，发生器可精确吸附到终点。
+    const float goalMm = _trackLengthMm - (error.along - remainingMm);
+    jerkStep(
+        _trackProfile,
+        goalMm,
+        _trackMaximumSpeedMm,
+        _trackAccelerationMm,
+        _trackJerkMm,
+        elapsedSeconds);
+    const float profileErrorMm =
+        _trackProfile.position + blendAlongMm - progressMm;
+    float alongSpeedMm =
+        _trackProfile.velocity + blendAlongSpeedMm +
+        TRACK_POSITION_KP_PER_S * profileErrorMm;
+    if (jerkFinished(_trackProfile, goalMm) &&
+        fabsf(profileErrorMm) > TRACK_ALONG_TOLERANCE_MM &&
+        fabsf(alongSpeedMm) < TRACK_MIN_SPEED_MM_PER_S)
+    {
+        alongSpeedMm = copysignf(TRACK_MIN_SPEED_MM_PER_S, profileErrorMm);
+    }
+    _trackAlongSpeedMm = clampMagnitude(alongSpeedMm, _trackMaximumSpeedMm);
+    const float crossSpeedMm =
+        crossCorrection(
+            crossErrorMm,
+            TRACK_CROSS_KP_PER_S,
+            _trackMaximumSpeedMm * TRACK_CROSS_MAX_RATIO,
+            TRACK_MIN_SPEED_MM_PER_S,
+            TRACK_CROSS_TOLERANCE_MM) +
+        crossFeedforwardMm;
+
+    // 沿程速度走u，横偏修正走左法向n=(-u.y, u.x)。
+    const float worldVelocityX =
+        _trackAlongSpeedMm * direction.x -
+        crossSpeedMm * direction.y;
+    const float worldVelocityY =
+        _trackAlongSpeedMm * direction.y +
+        crossSpeedMm * direction.x;
+    float forwardMmPerS = 0.0F;
+    float rightMmPerS = 0.0F;
+    worldToBody(
+        worldVelocityX,
+        worldVelocityY,
+        predictedWorldYawDeg(),
+        forwardMmPerS,
+        rightMmPerS);
+
+    float rotationStepsPerS = 0.0F;
+    if (_trackTurnStarted && !_trackYawReached)
+    {
+        rotationStepsPerS = rotationProfileSpeed(
+            wrap180(_trackTargetYawDeg - predictedYawDeg()));
+    }
+    else if (_translationHeadingEnabled)
+    {
+        const float headingErrorDeg = wrap180(_holdYawDeg - _yawDeg);
+        const float limit =
+            _trackMaximumWheelSpeed * HEADING_MAX_CORRECTION_RATIO;
+        rotationStepsPerS = clampMagnitude(
+            headingErrorDeg * HEADING_KP_STEPS_PER_S_PER_DEG,
+            limit);
+        if (fabsf(headingErrorDeg) >
+                TRANSLATION_FINAL_HEADING_TOLERANCE_DEG &&
+            fabsf(rotationStepsPerS) < ROTATE_MIN_STEPS_PER_S)
+        {
+            rotationStepsPerS = copysignf(
+                min(ROTATE_MIN_STEPS_PER_S, limit),
+                headingErrorDeg);
+        }
+    }
+
+    driveBodyVelocity(forwardMmPerS, rightMmPerS, rotationStepsPerS);
+}
+
+void ChassisControl::driveBodyVelocity(
+    float forwardMmPerS,
+    float rightMmPerS,
+    float rotationStepsPerS)
+{
+    /*
+     * 四麦轮逆运动学，电机顺序：左前、右前、左后、右后。
+     *
+     *   左前 = 前进 + 右移    右前 = 前进 - 右移
+     *   左后 = 前进 - 右移    右后 = 前进 + 右移
+     *
+     * 平移分量经MOTOR_SIGN适配安装方向；旋转分量按当前接线四轮同号。
+     */
+    const float calibratedForward =
+        forwardMmPerS * distanceScale(
+                            forwardMmPerS,
+                            FORWARD_DISTANCE_SCALE,
+                            BACKWARD_DISTANCE_SCALE);
+    const float calibratedRight =
+        rightMmPerS * distanceScale(
+                          rightMmPerS,
+                          RIGHT_DISTANCE_SCALE,
+                          LEFT_DISTANCE_SCALE);
+    const float wheelMmPerS[4] = {
+        calibratedForward + calibratedRight,
+        calibratedForward - calibratedRight,
+        calibratedForward - calibratedRight,
+        calibratedForward + calibratedRight};
+
+    float speeds[4] = {};
+    float peak = 0.0F;
     for (uint8_t i = 0; i < 4; ++i)
     {
-        const long remaining = _driver.distanceToGo(i);
-        if (remaining == 0)
-            continue;
-
-        const float direction = remaining > 0 ? 1.0f : -1.0f;
-        const float signedSpeed =
-            direction * _translationSpeed[i] + correction;
-        // 只防止零速度；不能设置较高的固定下限，否则会破坏
-        // 很短行程轮与长行程轮之间的同步比例。
-        _driver.setMaxSpeed(i, max(1.0f, fabsf(signedSpeed)));
+        speeds[i] =
+            wheelMmPerS[i] * STEPS_PER_MM * MOTOR_SIGN[i] +
+            rotationStepsPerS;
+        peak = max(peak, fabsf(speeds[i]));
     }
 
-    if (_driver.allStopped())
+    // 超过脉冲上限时四轮等比缩放，保持运动方向，而不是单轮削顶。
+    if (peak > MAX_STEP_RATE)
     {
-        _driver.halt();
-        if (_translationHeadingEnabled &&
-            _translationFinalHeadingSettleEnabled)
-        {
-            /*
-             * 行程完成不等于动作完成。巡航阶段的航向修正受各轮剩余
-             * 行程约束，最终再做一次小角度原地收敛，避免误差传给
-             * 下一段世界坐标路线或视觉对准。
-             */
-            _translationPhase = TranslationPhase::HeadingSettling;
-            resetYawStability();
-        }
-        else
-        {
-            _state = State::Idle;
-        }
+        const float scale = MAX_STEP_RATE / peak;
+        for (float &speed : speeds)
+            speed *= scale;
     }
+
+    _driver.setVelocities(speeds, _trackWheelAcceleration);
+}
+
+void ChassisControl::finishTranslation()
+{
+    if (_translationHeadingEnabled &&
+        _translationFinalHeadingSettleEnabled)
+    {
+        _translationPhase = TranslationPhase::HeadingSettling;
+        resetYawStability();
+        return;
+    }
+
+    _state = State::Idle;
+    LOGF_INFO("Chassis", "MOVE_COMPLETE pose=(%.1f, %.1f, %.1f°) duration=%lums",
+              _worldPose.xMm, _worldPose.yMm, _worldPose.yawDeg,
+              millis() - _motionStartMs);
 }
 
 void ChassisControl::updateRotation()
@@ -678,8 +1192,12 @@ void ChassisControl::updateRotation()
     if (updateYawSettle(_rotateTargetDeg, ROTATE_TOLERANCE_DEG))
     {
         _state = State::Idle;
-        LOGF_INFO("Chassis", "ROTATE_COMPLETE current=%.1f° target=%.1f° duration=%lums",
-                  _yawDeg, _rotateTargetDeg, millis() - _motionStartMs);
+        const float turnedDeg = wrap180(_yawDeg - _rotateStartYawDeg);
+        LOGF_INFO("Chassis", "ROTATE_COMPLETE current=%.1f° target=%.1f° duration=%lums stepsPerDeg=%.1f",
+                  _yawDeg, _rotateTargetDeg, millis() - _motionStartMs,
+                  fabsf(turnedDeg) > 10.0F
+                      ? fabsf((rotationSteps() - _rotateStartSteps) / turnedDeg)
+                      : 0.0F);
     }
 }
 
@@ -735,53 +1253,58 @@ bool ChassisControl::updateYawSettle(
         _stableSamples = 0;
         _stableSinceMs = 0;
     }
-    runYawController(error);
+    // 判定用实测角度，控制用外推角度，补偿IMU帧间延迟。
+    runYawController(wrap180(targetYawDeg - predictedYawDeg()));
     return false;
 }
 
 void ChassisControl::runYawController(float errorDeg)
 {
-    const float limit = rpmToStepsPerSecond(ROTATE_MAX_RPM);
+    const float speed = rotationProfileSpeed(errorDeg);
+    // 当前接线下，四个电机同号脉冲对应原地旋转。
+    const float speeds[4] = {speed, speed, speed, speed};
+    _driver.setVelocities(
+        speeds,
+        rpmToStepsPerSecond(ROTATE_ACCEL_RPM_PER_S));
+}
+
+float ChassisControl::rotationProfileSpeed(float errorDeg)
+{
+    /*
+     * 远处按v=√(2a(θ-θl/2))减速，θl=a/K²以内改为v=Kθ，两段在θl处连续。
+     * 纯√曲线在零点斜率无穷大，IMU延迟会直接变成过冲和来回震荡。
+     */
+    const float deceleration =
+        rpmToStepsPerSecond(ROTATE_ACCEL_RPM_PER_S) * ROTATE_DECEL_RATIO;
+    const float errorSteps = fabsf(errorDeg) * ROTATION_STEPS_PER_DEG;
+    const float linearSteps =
+        deceleration / (ROTATE_FINAL_GAIN_PER_S * ROTATE_FINAL_GAIN_PER_S);
+    const float profileSpeed =
+        errorSteps <= linearSteps
+            ? ROTATE_FINAL_GAIN_PER_S * errorSteps
+            : sqrtf(2.0F * deceleration * (errorSteps - 0.5F * linearSteps));
+    const float speed = constrain(
+        profileSpeed,
+        ROTATE_MIN_STEPS_PER_S,
+        rpmToStepsPerSecond(ROTATE_MAX_RPM));
+    return slewRotationCommand(copysignf(speed, errorDeg));
+}
+
+long ChassisControl::rotationSteps() const
+{
+    // 四轮原始脉冲之和中平移分量按MOTOR_SIGN抵消，只剩旋转分量。
+    long steps[4] = {};
+    _driver.positions(steps);
+    return (steps[0] + steps[1] + steps[2] + steps[3]) / 4;
+}
+
+float ChassisControl::slewRotationCommand(float targetSpeed)
+{
     const float acceleration =
         rpmToStepsPerSecond(ROTATE_ACCEL_RPM_PER_S);
-
-    /*
-     * 只在收到新IMU帧时更新角速度，避免主循环在同一帧上重复微分。
-     * 一阶低通压制JY901角度量化噪声，PD的D项用于接近目标时提前制动。
-     */
-    if (_rotateLastImuSequence != _imuSequence)
-    {
-        const uint32_t sampleMs = _lastImuMs;
-        const uint32_t elapsedMs = sampleMs - _rotateLastYawMs;
-        if (elapsedMs > 0)
-        {
-            const float instantaneousYawRate =
-                wrap180(_yawDeg - _rotateLastYawDeg) *
-                1000.0F / static_cast<float>(elapsedMs);
-            _rotateFilteredYawRate +=
-                ROTATE_YAW_RATE_FILTER_ALPHA *
-                (instantaneousYawRate - _rotateFilteredYawRate);
-        }
-        _rotateLastYawDeg = _yawDeg;
-        _rotateLastYawMs = sampleMs;
-        _rotateLastImuSequence = _imuSequence;
-    }
-
-    float targetSpeed = constrain(
-        errorDeg * ROTATE_KP_STEPS_PER_S_PER_DEG -
-            _rotateFilteredYawRate *
-                ROTATE_KD_STEPS_PER_S_PER_DEG_PER_S,
-        -limit,
-        limit);
-    if (targetSpeed * errorDeg > 0.0F &&
-        fabsf(targetSpeed) < ROTATE_MIN_STEPS_PER_S)
-    {
-        targetSpeed = copysignf(ROTATE_MIN_STEPS_PER_S, errorDeg);
-    }
-
     /*
      * 按真实时间限制每次速度变化量，使ROTATE_ACCEL_RPM_PER_S实际生效。
-     * 脉冲中断也按同一加速度限速，这里的斜坡保证PD输出本身平滑。
+     * 脉冲中断也按同一加速度限速，这里的斜坡保证输出本身平滑。
      */
     const uint32_t nowUs = micros();
     const float elapsedSeconds = min(
@@ -793,14 +1316,7 @@ void ChassisControl::runYawController(float errorDeg)
         targetSpeed - _rotateCommandSpeed,
         -maximumDelta,
         maximumDelta);
-
-    // 当前接线下，四个电机同号脉冲对应原地旋转。
-    const float speeds[4] = {
-        _rotateCommandSpeed,
-        _rotateCommandSpeed,
-        _rotateCommandSpeed,
-        _rotateCommandSpeed};
-    _driver.setVelocities(speeds, acceleration);
+    return _rotateCommandSpeed;
 }
 
 void ChassisControl::resetYawStability()
@@ -809,10 +1325,6 @@ void ChassisControl::resetYawStability()
     _stableSinceMs = 0;
     _lastEvaluatedImuSequence = _imuSequence;
     _rotateCommandSpeed = 0.0F;
-    _rotateFilteredYawRate = 0.0F;
-    _rotateLastYawDeg = _yawDeg;
-    _rotateLastYawMs = _lastImuMs;
-    _rotateLastImuSequence = _imuSequence;
     _rotateLastControlUs = micros();
 }
 
