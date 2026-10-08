@@ -26,7 +26,7 @@ namespace vision_config
     constexpr int16_t CENTER_TOLERANCE_PX = 25;
     // 旧项目约连续稳定50ms即下降；两帧可兼顾速度和单帧抗噪。
     constexpr uint8_t REQUIRED_STABLE_FRAMES = 2;
-    constexpr uint8_t MIN_QUALITY = 30;
+    constexpr uint8_t MIN_QUALITY = 5;
 
     // 识别结果按15~20FPS输出；超过约4帧未更新即视为目标陈旧。
     constexpr uint32_t TARGET_STALE_MS = 250;
@@ -124,7 +124,7 @@ namespace vision_config
      */
     constexpr int16_t RING_CENTER_TOLERANCE_PX = 1;
     constexpr int16_t RING_FINE_ALIGNMENT_ZONE_PX = 25;
-    constexpr uint8_t RING_REQUIRED_STABLE_FRAMES = 30;
+    constexpr uint8_t RING_REQUIRED_STABLE_FRAMES = 3;
     constexpr uint8_t RING_MIN_QUALITY = 30;
 
     /*
@@ -139,7 +139,15 @@ namespace vision_config
     constexpr float RING_FINE_MAX_MOVE_MM = 10.0F;
     // 15~20FPS下留出约4帧，避免短暂抖动误清稳定计数。
     constexpr uint32_t RING_TARGET_STALE_MS = 250;
-    constexpr uint32_t RING_ALIGNMENT_TIMEOUT_MS = 12000;
+    constexpr uint32_t RING_ALIGNMENT_TIMEOUT_MS = 15000;
+    /*
+     * 粗加工区到位后圆环不在视野时的搜索：等待RING_SEARCH_START_MS仍
+     * 没有看到圆环，就围绕到位点按方环逐点平移（每步RING_SEARCH_RADIUS_MM），
+     * 每步到位后停留RING_SEARCH_DWELL_MS等待新图像。看到圆环即转入原有闭环。
+     */
+    constexpr uint32_t RING_SEARCH_START_MS = 1500;
+    constexpr uint32_t RING_SEARCH_DWELL_MS = 500;
+    constexpr float RING_SEARCH_RADIUS_MM = 50.0F;
     /*
      * 第二轮暂存区优先识别第一轮2号位物料颜色；若该物料漏抓或漏放，
      * 数秒内没有任何可靠颜色观测就切回仍然可见的固定2号圆环。

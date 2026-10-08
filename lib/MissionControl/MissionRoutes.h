@@ -62,13 +62,21 @@ namespace mission_routes
         {field_config::UPPER_RIGHT_START.xMm,
          field_config::UPPER_RIGHT_START.yMm},
         -180.0F};
-    constexpr FieldPose MATERIAL_ANCHOR = {{1200.0F, 2150.0F}, 90.0F};
+    constexpr FieldPose MATERIAL_ANCHOR = {{1200.0F, 2100.0F}, 90.0F};
+    // 取完料后的归位转向点：x与原料区轴线一致，y比取料锚点小以避开物料盘。
+    constexpr FieldPoint MATERIAL_TURN_POINT = {
+        MATERIAL_ANCHOR.position.xMm, 2100.0F};
     // 粗加工区直接使用视觉实测作业点，到站和离站都不再产生对准差值。
+    // 进站偏移：只移动漂移到位点，不改变对准成功后重写的世界坐标。
+    constexpr float ROUGH_APPROACH_OFFSET_X_MM = 90.0F;
+    constexpr float ROUGH_APPROACH_OFFSET_Y_MM = 50.0F;
     constexpr FieldPose ROUGH_ANCHOR = {
-        {vision_config::ROUGH_ALIGNED_WORLD_X_MM,
-         vision_config::ROUGH_ALIGNED_WORLD_Y_MM},
+        {vision_config::ROUGH_ALIGNED_WORLD_X_MM +
+             ROUGH_APPROACH_OFFSET_X_MM,
+         vision_config::ROUGH_ALIGNED_WORLD_Y_MM +
+             ROUGH_APPROACH_OFFSET_Y_MM},
         -90.0F};
-    constexpr FieldPose STORAGE_ANCHOR = {{2100.0F, 1220.0F}, -180.0F};
+    constexpr FieldPose STORAGE_ANCHOR = {{2040.0F, 1220.0F}, -180.0F};
 
     // 原料区到粗加工区沿世界-y方向行驶，车头需先转向-180度。
     constexpr float MATERIAL_TO_ROUGH_TRAVEL_YAW_DEG = -180.0F;
@@ -128,6 +136,9 @@ namespace mission_routes
             MATERIAL_ANCHOR.position.xMm,
             MATERIAL_ANCHOR.position.yMm) &&
             field_config::hasRotationClearance(
+                MATERIAL_TURN_POINT.xMm,
+                MATERIAL_TURN_POINT.yMm) &&
+            field_config::hasRotationClearance(
                 ROUGH_AXIS_END.xMm,
                 ROUGH_AXIS_END.yMm) &&
             field_config::hasRotationClearance(
@@ -150,19 +161,21 @@ namespace mission_routes
     // 原料区原地转-180度后一条指令到粗加工区：沿原料区x轴线快速直行，
     // 距作业点POSE_MOVE_TURN_WINDOW_MM处边转-90度边并入x偏差，中途不停车。
     constexpr RouteAction MATERIAL_TO_ROUGH[] = {
-        fastTo(MATERIAL_ANCHOR.position),
+        fastTo(MATERIAL_TURN_POINT),
         routeRotateTo(MATERIAL_TO_ROUGH_TRAVEL_YAW_DEG),
         driftTo(ROUGH_ANCHOR),
     };
 
-    // 粗加工区 -> 暂存区：进入窗口后边走边转，漂移到位。
     constexpr RouteAction ROUGH_TO_STORAGE[] = {
-        driftTo(STORAGE_ANCHOR),
+        fastTo(ROUGH_STORAGE_CORNER),
+        routeRotateTo(STORAGE_ANCHOR.yawDeg),
+        fastTo(STORAGE_ANCHOR.position),
     };
 
-    // 暂存区 -> 原料区（第二轮）：边走边转，漂移到原料区位姿。
     constexpr RouteAction STORAGE_TO_MATERIAL_SECOND[] = {
-        driftTo(MATERIAL_ANCHOR),
+        fastTo(STORAGE_MATERIAL_CORNER),
+        routeRotateTo(MATERIAL_ANCHOR.yawDeg),
+        fastTo(MATERIAL_ANCHOR.position),
     };
 
     /*

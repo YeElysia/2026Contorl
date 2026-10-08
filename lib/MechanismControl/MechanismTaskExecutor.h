@@ -87,11 +87,21 @@ public:
     bool startRoughPlacementCalibration(
         uint8_t ring,
         uint16_t speed,
-        uint8_t acceleration);
+        uint8_t acceleration,
+        const mechanism_config::RingPose &pose,
+        uint8_t traySlot = 0);
     bool startRoughReturnCalibration(
         uint8_t ring,
         uint16_t speed,
         uint8_t acceleration);
+    bool startTrayPutBackTest(
+        float slotAngle,
+        float base,
+        float extension,
+        float liftDown);
+#ifdef FIRST_LAYER_PLACEMENT_TEST
+    bool prepareFirstLayerTest(uint8_t loadedSlotMask);
+#endif
     void update() override;
     AsyncResult result() const override;
     void cancel() override;
@@ -104,12 +114,14 @@ private:
         RotateBase,
         RotateBaseRoughCalibration,
         RotateBaseRoughReturn,
+        RotateBaseFirstLayerRingOneReturn,
         RotateBaseRoughReturnCalibration,
         RotateStorage,
         OpenGripper,
         OpenGripperMax,
         CloseGripperUnloaded,
-        CloseGripper
+        CloseGripper,
+        CloseGripperGrasp
     };
 
     struct ActionStep
@@ -141,6 +153,7 @@ private:
         FinalStoring,
         CalibratingRoughPlacement,
         CalibratingRoughReturn,
+        TestingTrayPutBack,
         Idle
     };
 
@@ -163,6 +176,9 @@ private:
     FSUS_Servo _gripperServo;
     GraspDebugState _graspDebug;
     MotionDebugState _motionDebug;
+    uint32_t _busMonitorStartMs = 0;
+    uint32_t _busMonitorNextMs = 0;
+    void monitorStepperBusAfterFault();
 
     ActionStep _steps[MAX_ACTION_STEPS] = {};
     uint8_t _stepCount = 0;
@@ -189,6 +205,7 @@ private:
     bool _pickupReferenceValid = false;
     bool _pickupTargetSeen = false;
     bool _storageToRoughFastProfile = false;
+    bool _pickupToTrayFastProfile = false;
     bool _roughPlacementCalibrationActive = false;
     uint16_t _roughPlacementCalibrationSpeed = 0;
     uint8_t _roughPlacementCalibrationAcceleration = 0;
@@ -227,7 +244,9 @@ private:
         float extensionTarget,
         int8_t storageSlotToPrepare = -1);
     void addRoughRingToTrayRetraction(uint8_t ring);
-    void addStorageDeposit(bool liftAfterDeposit = true);
+    void addStorageDeposit(
+        bool liftAfterDeposit = true,
+        bool extendToTransfer = true);
     void appendStoragePreparation(
         uint8_t traySlot,
         uint8_t group);

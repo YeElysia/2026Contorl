@@ -6,6 +6,55 @@
 
 using namespace mechanism_config;
 
+namespace
+{
+// 查询驱动器状态；line非空时额外记录RX/TX空闲电平和查询后RX线10 ms内的电平翻转次数。
+uint8_t probeDriverStatus(
+    TTL_Protocol &protocol,
+    uint8_t id,
+    char *hex,
+    size_t hexSize,
+    uint32_t rxPin = STEPPER_RX_PIN,
+    uint32_t txPin = STEPPER_TX_PIN,
+    char *line = nullptr,
+    size_t lineSize = 0)
+{
+    protocol.emptyCache();
+    const int rxIdle = line ? digitalRead(rxPin) : 0;
+    const int txIdle = line ? digitalRead(txPin) : 0;
+    const uint8_t query[3] = {id, 0x3A, 0x6B};
+    protocol.serial->write(query, sizeof(query));
+
+    uint32_t edges = 0;
+    if (line)
+    {
+        protocol.serial->flush();
+        int last = digitalRead(rxPin);
+        const uint32_t startedUs = micros();
+        while (micros() - startedUs < 10000U)
+        {
+            const int level = digitalRead(rxPin);
+            if (level != last)
+            {
+                ++edges;
+                last = level;
+            }
+        }
+        snprintf(line, lineSize, "idle rx=%d tx=%d rx_edges=%lu",
+                 rxIdle, txIdle, static_cast<unsigned long>(edges));
+    }
+
+    uint8_t rx[16] = {};
+    uint8_t rxCount = 0;
+    protocol.Emm_V5_Receive_Data(rx, &rxCount);
+    hex[0] = '\0';
+    const uint8_t shown = rxCount < sizeof(rx) ? rxCount : sizeof(rx);
+    for (uint8_t i = 0; i < shown && 3U * i + 3U < hexSize; ++i)
+        snprintf(hex + 3U * i, 4, "%02X ", rx[i]);
+    return rxCount;
+}
+} // namespace
+
 MechanismTaskExecutor::MechanismTaskExecutor(
     HardwareSerial &stepperSerial,
     HardwareSerial &baseSerial,
@@ -178,6 +227,8 @@ const char *MechanismTaskExecutor::debugPhase() const
         return "ROUGH_PLACE_CAL";
     case TaskPhase::CalibratingRoughReturn:
         return "ROUGH_RETURN_CAL";
+    case TaskPhase::TestingTrayPutBack:
+        return "TRAY_PUTBACK_TEST";
     case TaskPhase::Idle:
         return "IDLE";
     }
@@ -325,10 +376,30 @@ bool MechanismTaskExecutor::start(
     return true;
 }
 
+#ifdef FIRST_LAYER_PLACEMENT_TEST
+bool MechanismTaskExecutor::prepareFirstLayerTest(uint8_t loadedSlotMask)
+{
+    if (!ready() || _result == AsyncResult::Running ||
+        loadedSlotMask == 0 || (loadedSlotMask & ~0x07U) != 0)
+    {
+        return false;
+    }
+
+    _round = 0;
+    _collectedItemMask[0] = loadedSlotMask;
+    _collectedItemMask[1] = 0;
+    _missedItemMask[0] = 0;
+    _missedItemMask[1] = 0;
+    return true;
+}
+#endif
+
 bool MechanismTaskExecutor::startRoughPlacementCalibration(
     uint8_t ring,
     uint16_t speed,
-    uint8_t acceleration)
+    uint8_t acceleration,
+    const RingPose &pose,
+    uint8_t traySlot)
 {
     if (!ready() ||
         _result == AsyncResult::Running ||
@@ -349,15 +420,15 @@ bool MechanismTaskExecutor::startRoughPlacementCalibration(
     _fault = "";
     _phase = TaskPhase::CalibratingRoughPlacement;
 
-    const RingPose &pose = ROUGH_RING_POSES[ring];
-
-    // 固定从储料盘3号槽取料，测试期间不再旋转载物盘。
+    // traySlot为0时固定用当前料槽（begin时的3号槽）；1~3时随底座回盘预转到该槽。
     addStep(StepKind::Lift, LIFT_HOME);
     addStep(StepKind::RotateBase, BASE_TRAY_TRANSFER);
+    if (traySlot >= 1 && traySlot <= MATERIALS_PER_BATCH)
+        appendStoragePreparation(traySlot, _steps[_stepCount - 1].group);
     addConcurrentStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
     addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
     addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+    addStep(StepKind::CloseGripperGrasp, GRIPPER_CLOSE_ANGLE);
 
     // 与正式出盘一致：先到Home，再三轴并行到圆环完整点位。
     addStep(StepKind::Lift, LIFT_HOME);
@@ -419,7 +490,7 @@ bool MechanismTaskExecutor::startRoughReturnCalibration(
         StepKind::OpenGripper,
         GRIPPER_OPEN_ANGLE,
         arrivalGroup);
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+    addStep(StepKind::CloseGripperGrasp, GRIPPER_CLOSE_ANGLE);
 
     // 先竖直上抬100，再用候选参数三轴并行直接回2770。
     addStep(
@@ -433,18 +504,87 @@ bool MechanismTaskExecutor::startRoughReturnCalibration(
         returnGroup);
     appendStep(
         StepKind::Extend,
-        EXTENSION_HOME,
+        EXTENSION_TRAY_TRANSFER,
         returnGroup);
 
     // 回程到位后放入固定的3号料盘位。
-    addStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
     addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
     addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
     return true;
 }
 
+bool MechanismTaskExecutor::startTrayPutBackTest(
+    float slotAngle,
+    float base,
+    float extension,
+    float liftDown)
+{
+    if (!ready() || _result == AsyncResult::Running)
+        return false;
+
+    clearAction();
+    _result = AsyncResult::Running;
+    _fault = "";
+    _phase = TaskPhase::TestingTrayPutBack;
+
+    // 先夹紧（手放的物料或空爪），再按正式回盘顺序送到载物盘。
+    addStep(StepKind::CloseGripperGrasp, GRIPPER_CLOSE_ANGLE);
+    addStep(StepKind::Lift, LIFT_HOME);
+    addStep(StepKind::RotateBase, base);
+    const uint8_t arrivalGroup = _steps[_stepCount - 1].group;
+    appendStep(StepKind::Extend, EXTENSION_HOME, arrivalGroup);
+    appendStep(StepKind::RotateStorage, slotAngle, arrivalGroup);
+
+    // 与addStorageDeposit一致：伸到交接位，下降，松爪，再抬回Home。
+    addStep(StepKind::Extend, extension);
+    addStep(StepKind::Lift, liftDown);
+    addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
+    addStep(StepKind::Lift, LIFT_HOME);
+    return true;
+}
+
+void MechanismTaskExecutor::monitorStepperBusAfterFault()
+{
+    const uint32_t now = millis();
+    if (static_cast<int32_t>(now - _busMonitorNextMs) < 0)
+        return;
+
+    constexpr uint32_t MONITOR_DURATION_MS = 15000;
+    const uint32_t elapsed = now - _busMonitorStartMs;
+    if (elapsed > MONITOR_DURATION_MS)
+    {
+        _busMonitorStartMs = 0;
+        LOG_WARNING("Stepper", "BUS_MONITOR end");
+        return;
+    }
+    _busMonitorNextMs = now + 500;
+
+    char liftHex[24] = {};
+    char extHex[24] = {};
+    char baseHex[24] = {};
+    char liftLine[64] = {};
+    const uint8_t lift = probeDriverStatus(
+        _stepperProtocol, LIFT_STEPPER_ID, liftHex, sizeof(liftHex),
+        STEPPER_RX_PIN, STEPPER_TX_PIN, liftLine, sizeof(liftLine));
+    const uint8_t ext = probeDriverStatus(
+        _stepperProtocol, EXTENSION_STEPPER_ID, extHex, sizeof(extHex));
+    const uint8_t base = probeDriverStatus(
+        _baseProtocol, BASE_STEPPER_ID, baseHex, sizeof(baseHex));
+    LOGF_WARNING(
+        "Stepper",
+        "BUS_MONITOR +%lums lift(7)=%s ext(6)=%s base(5)=%s | %s",
+        static_cast<unsigned long>(elapsed),
+        lift ? liftHex : "NONE",
+        ext ? extHex : "NONE",
+        base ? baseHex : "NONE",
+        liftLine);
+}
+
 void MechanismTaskExecutor::update()
 {
+    if (_busMonitorStartMs != 0)
+        monitorStepperBusAfterFault();
+
     if (_result != AsyncResult::Running)
         return;
 
@@ -524,6 +664,7 @@ void MechanismTaskExecutor::clearAction()
     _sharedPollOwner = nullptr;
     _lastSharedBusPollMs = 0;
     _storageToRoughFastProfile = false;
+    _pickupToTrayFastProfile = false;
 }
 
 void MechanismTaskExecutor::addStep(
@@ -679,8 +820,8 @@ void MechanismTaskExecutor::addRoughRingToTrayRetraction(uint8_t ring)
     }
 
     /*
-     * 调用方已经先上抬100并脱离物料。随后升降回120、伸缩回收、
-     * 底座按当前圆环慢速档直接到2770，三轴同组并行且不再经2400。
+     * 调用方已经先上抬100并脱离物料。随后升降回Home，底座和伸缩
+     * 并行直接回到载物盘交接位置，避免额外经过1500的收回动作。
      */
     addStep(StepKind::Lift, LIFT_HOME);
     const uint8_t safeGroup = _steps[_stepCount - 1].group;
@@ -690,14 +831,17 @@ void MechanismTaskExecutor::addRoughRingToTrayRetraction(uint8_t ring)
         safeGroup);
     appendStep(
         StepKind::Extend,
-        EXTENSION_HOME,
+        EXTENSION_TRAY_TRANSFER,
         safeGroup);
 }
 
-void MechanismTaskExecutor::addStorageDeposit(bool liftAfterDeposit)
+void MechanismTaskExecutor::addStorageDeposit(
+    bool liftAfterDeposit,
+    bool extendToTransfer)
 {
     // 底座已经进入车内方向后，按固定安全顺序将物料放回载物盘。
-    addStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
+    if (extendToTransfer)
+        addStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
     addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
     addStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
     if (liftAfterDeposit)
@@ -829,7 +973,7 @@ void MechanismTaskExecutor::loadTurntableApproachAction()
 void MechanismTaskExecutor::loadTurntableGraspAction()
 {
     clearAction();
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+    addStep(StepKind::CloseGripperGrasp, GRIPPER_CLOSE_ANGLE);
 }
 
 void MechanismTaskExecutor::loadPickupToStorageAction(
@@ -837,20 +981,21 @@ void MechanismTaskExecutor::loadPickupToStorageAction(
     bool liftAfterDeposit)
 {
     clearAction();
+    _pickupToTrayFastProfile = true;
 
     /*
-     * 闭爪后先升到安全高度。随后在底座回车内、伸缩轴回收的同时，
-     * 再次明确将当前储料槽转到交接位，避免只依赖抓取准备阶段的
-     * 预旋转状态。三个动作全部完成后才允许机械臂下降存料。
+     * 闭爪后先升到安全高度。随后在底座回车内，伸缩轴直接收到
+     * 交接位，同时再次明确将当前储料槽转到交接位，避免只依赖
+     * 抓取准备阶段的预旋转状态。三个动作全部完成后才允许下降存料。
      */
     addStep(StepKind::Lift, LIFT_HOME);
     addStep(StepKind::RotateBase, BASE_TRAY_TRANSFER);
-    addConcurrentStep(StepKind::Extend, EXTENSION_HOME);
+    addConcurrentStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
     appendStoragePreparation(
         traySlot,
         _steps[_stepCount - 1].group);
 
-    addStorageDeposit(liftAfterDeposit);
+    addStorageDeposit(liftAfterDeposit, false);
 }
 
 void MechanismTaskExecutor::loadSkippedPickupRecoveryAction()
@@ -984,12 +1129,20 @@ void MechanismTaskExecutor::updatePickupAlignment()
      */
     if (_graspVision.faulted())
     {
+        LOGF_WARNING(
+            "Mechanism",
+            "Skip item %u: vision rejected/no ACK/released",
+            static_cast<unsigned>(_itemIndex + 1));
         skipCurrentPickup();
         return;
     }
 
     if (now - _alignmentStartedMs >= TARGET_SEARCH_TIMEOUT_MS)
     {
+        LOGF_WARNING(
+            "Mechanism",
+            "Skip item %u: search timeout",
+            static_cast<unsigned>(_itemIndex + 1));
         _graspDebug.tracking = false;
         skipCurrentPickup();
         return;
@@ -1246,6 +1399,10 @@ void MechanismTaskExecutor::advancePickupSearch()
         _pickupSearchIndex = 0;
         if (++_pickupSearchPass >= PICKUP_SEARCH_MAX_PASSES)
         {
+            LOGF_WARNING(
+                "Mechanism",
+                "Skip item %u: target not found after search",
+                static_cast<unsigned>(_itemIndex + 1));
             _graspDebug.tracking = false;
             skipCurrentPickup();
             return;
@@ -1461,18 +1618,22 @@ void MechanismTaskExecutor::loadStorageToRingAction(
             EXTENSION_TRAY_TRANSFER);
         addConcurrentStep(StepKind::OpenGripper, GRIPPER_OPEN_ANGLE);
     }
-    else if (!storageSlotPrepared(traySlot))
+    else
     {
         /*
-         * 正常情况下下一槽已在上一件赴圆环时预转完成。若预转状态
-         * 丢失，仅补做料盘定位，不能带着错误槽位直接下降取料。
+         * 上一件回盘后伸缩轴只收到EXTENSION_HOME，连续件取料前必须
+         * 补到交接位。正常情况下下一槽已在赴圆环时预转完成；若预转
+         * 状态丢失，则同时补做料盘定位，不能带着错误槽位下降取料。
          */
-        addStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[traySlot]);
+        addStep(StepKind::Extend, EXTENSION_TRAY_TRANSFER);
+        appendStoragePreparation(
+            traySlot,
+            _steps[_stepCount - 1].group);
     }
 
-    // 连续件可从已经确认完成的车内取料姿态直接下降。
+    // 底座、伸缩和料槽均已就位，下降取料；夹紧保持后才允许抬升。
     addStep(StepKind::Lift, LIFT_TRAY_TRANSFER);
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+    addStep(StepKind::CloseGripperGrasp, GRIPPER_CLOSE_ANGLE);
 
     const float placementLiftTarget =
         pose.lift - stackLevel * MATERIAL_HEIGHT;
@@ -1543,8 +1704,9 @@ void MechanismTaskExecutor::loadStorageToRingAction(
         }
         else
         {
-            // 第一层尚无垛料障碍，恢复原来的三轴并行回盘。
-            addParallelTransfer(BASE_TRAY_TRANSFER);
+            addParallelTransfer(BASE_TRAY_TRANSFER, EXTENSION_TRAY_TRANSFER);
+            if (_batch.storagePositions[_itemIndex] == 1)
+                _steps[_stepCount - 2].kind = StepKind::RotateBaseFirstLayerRingOneReturn;
         }
     }
 }
@@ -1598,7 +1760,7 @@ void MechanismTaskExecutor::loadRingToStorageAction(
         addStep(StepKind::Lift, pose.lift);
     }
 
-    addStep(StepKind::CloseGripper, GRIPPER_CLOSE_ANGLE);
+    addStep(StepKind::CloseGripperGrasp, GRIPPER_CLOSE_ANGLE);
 
     // 先从圆环竖直提起物料，再进入慢速并行回盘动作。
     addStep(
@@ -1634,7 +1796,19 @@ bool MechanismTaskExecutor::updateCurrentStep()
     {
         ActionStep &step = _steps[i];
         if (!step.completed)
+        {
             step.completed = updateActionStep(step);
+            if (step.completed && step.issued)
+            {
+                LOGF_INFO(
+                    "Mechanism",
+                    "Step done: kind=%u group=%u elapsed=%lums",
+                    static_cast<unsigned>(step.kind),
+                    static_cast<unsigned>(step.group),
+                    static_cast<unsigned long>(
+                        millis() - step.startedMs));
+            }
+        }
         if (_result == AsyncResult::Failed)
         {
             LOG_ERROR("Mechanism", "Step execution failed!");
@@ -1670,6 +1844,7 @@ bool MechanismTaskExecutor::updateActionStep(ActionStep &step)
     case StepKind::RotateBase:
     case StepKind::RotateBaseRoughCalibration:
     case StepKind::RotateBaseRoughReturn:
+    case StepKind::RotateBaseFirstLayerRingOneReturn:
     case StepKind::RotateBaseRoughReturnCalibration:
         return updateStepperStep(_base, step, true);
 
@@ -1678,6 +1853,7 @@ bool MechanismTaskExecutor::updateActionStep(ActionStep &step)
     case StepKind::OpenGripperMax:
     case StepKind::CloseGripperUnloaded:
     case StepKind::CloseGripper:
+    case StepKind::CloseGripperGrasp:
         return updateServoStep(step);
     }
 
@@ -1732,6 +1908,13 @@ bool MechanismTaskExecutor::issueStepperCommand(
             }
         }
 
+        if (_pickupToTrayFastProfile &&
+            step.kind == StepKind::RotateBase)
+        {
+            velocity = PICKUP_TO_TRAY_BASE_SPEED;
+            acceleration = PICKUP_TO_TRAY_BASE_ACCELERATION;
+        }
+
         if (step.kind == StepKind::RotateBaseRoughCalibration &&
             _roughPlacementCalibrationActive)
         {
@@ -1747,7 +1930,8 @@ bool MechanismTaskExecutor::issueStepperCommand(
             acceleration =
                 _roughReturnCalibrationAcceleration;
         }
-        else if (step.kind == StepKind::RotateBaseRoughReturn &&
+        else if ((step.kind == StepKind::RotateBaseRoughReturn ||
+                  step.kind == StepKind::RotateBaseFirstLayerRingOneReturn) &&
                  _itemIndex < MATERIALS_PER_BATCH)
         {
             const uint8_t ring =
@@ -1757,6 +1941,12 @@ bool MechanismTaskExecutor::issueStepperCommand(
                 velocity = ROUGH_RING_TO_TRAY_SPEED[ring];
                 acceleration =
                     ROUGH_RING_TO_TRAY_ACCELERATION[ring];
+                if (step.kind == StepKind::RotateBaseFirstLayerRingOneReturn &&
+                    ring == 1)
+                {
+                    velocity = FIRST_LAYER_RING_ONE_TO_TRAY_SPEED;
+                    acceleration = FIRST_LAYER_RING_ONE_TO_TRAY_ACCELERATION;
+                }
             }
         }
 
@@ -1793,6 +1983,35 @@ bool MechanismTaskExecutor::issueStepperCommand(
 
     if (!commandAccepted)
     {
+        if (&motor == &_lift || &motor == &_extension)
+        {
+            // 升降与伸缩共用USART2：对同总线另一驱动器、以及重启串口后再查询，区分驱动器失联与MCU串口接收异常。
+            const uint8_t siblingId =
+                &motor == &_lift ? EXTENSION_STEPPER_ID : LIFT_STEPPER_ID;
+            char hex[48] = {};
+            char line[64] = {};
+            uint8_t n = probeDriverStatus(
+                _stepperProtocol, siblingId, hex, sizeof(hex),
+                STEPPER_RX_PIN, STEPPER_TX_PIN, line, sizeof(line));
+            LOGF_WARNING(
+                "Stepper",
+                "BUS_DIAG sibling id=%u rx=%u: %s | %s",
+                siblingId, static_cast<unsigned>(n), n ? hex : "NONE", line);
+
+            _stepperSerial.end();
+            _stepperSerial.begin(BUS_BAUD);
+            n = probeDriverStatus(
+                _stepperProtocol, motor.addr, hex, sizeof(hex),
+                STEPPER_RX_PIN, STEPPER_TX_PIN, line, sizeof(line));
+            LOGF_WARNING(
+                "Stepper",
+                "BUS_DIAG after UART reinit id=%u rx=%u: %s | %s",
+                motor.addr, static_cast<unsigned>(n), n ? hex : "NONE", line);
+
+            _busMonitorStartMs = millis() | 1U;
+            _busMonitorNextMs = _busMonitorStartMs + 500;
+        }
+
         LOGF_ERROR(
             "Mechanism",
             "Stepper command rejected: id=%u kind=%u target_x10=%ld",
@@ -2033,6 +2252,7 @@ void MechanismTaskExecutor::issueServoStep(ActionStep &step)
         break;
     case StepKind::CloseGripperUnloaded:
     case StepKind::CloseGripper:
+    case StepKind::CloseGripperGrasp:
         _gripperServo.setAngle(
             step.target,
             GRIPPER_CLOSE_INTERVAL_MS,
@@ -2070,9 +2290,13 @@ bool MechanismTaskExecutor::updateServoStep(ActionStep &step)
                 step.kind == StepKind::OpenGripperMax
             ? GRIPPER_OPEN_INTERVAL_MS
             : GRIPPER_CLOSE_INTERVAL_MS;
+    const uint32_t hold =
+        step.kind == StepKind::CloseGripperGrasp
+            ? GRIPPER_GRASP_HOLD_MS
+            : 0;
     return elapsed >=
            static_cast<uint32_t>(interval) +
-               GRIPPER_SETTLE_MS;
+               GRIPPER_SETTLE_MS + hold;
 }
 
 void MechanismTaskExecutor::onActionCompleted()
@@ -2192,6 +2416,12 @@ void MechanismTaskExecutor::onActionCompleted()
 
     case TaskPhase::CalibratingRoughReturn:
         _roughReturnCalibrationActive = false;
+        _phase = TaskPhase::Idle;
+        _result = AsyncResult::Succeeded;
+        clearAction();
+        break;
+
+    case TaskPhase::TestingTrayPutBack:
         _phase = TaskPhase::Idle;
         _result = AsyncResult::Succeeded;
         clearAction();

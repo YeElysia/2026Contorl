@@ -1,9 +1,25 @@
 #include "MaixProRingAlignment.h"
 
+#include "DebugLog.h"
 #include "chassis_config.h"
 #include "vision_config.h"
 
 #include <math.h>
+
+namespace
+{
+struct SearchDirection
+{
+    int8_t forward;
+    int8_t right;
+};
+
+// 围绕到位点的方环，相邻点相距一个搜索半径。
+constexpr SearchDirection SEARCH_RING[] = {
+    {1, 0}, {1, 1}, {0, 1}, {-1, 1}, {-1, 0}, {-1, -1}, {0, -1}, {1, -1}};
+constexpr uint8_t SEARCH_RING_COUNT =
+    sizeof(SEARCH_RING) / sizeof(SEARCH_RING[0]);
+} // namespace
 
 MaixProRingAlignment::MaixProRingAlignment(
     maixcam::MaixVisionService &vision,
@@ -22,6 +38,10 @@ bool MaixProRingAlignment::start(
     _allowRingFallback = false;
     _ringFallbackActive = false;
     _targetSeen = false;
+    _searchStep = 0;
+    _searchForwardMm = 0.0F;
+    _searchRightMm = 0.0F;
+    _searchReadyMs = 0;
 
     // 原料区由机械臂逐物料视觉对准，不执行额外整车对准。
     if (request.station == Station::Material)
@@ -93,20 +113,20 @@ void MaixProRingAlignment::update()
     if (visionStatus != maixcam::MaixVisionService::Status::Pending &&
         visionStatus != maixcam::MaixVisionService::Status::Active)
     {
-        fail();
+        fail("vision request lost");
         return;
     }
 
     const uint32_t now = millis();
     if (now - _startedMs >= RING_ALIGNMENT_TIMEOUT_MS)
     {
-        fail();
+        fail("timeout");
         return;
     }
 
     if (_chassis.faulted())
     {
-        fail();
+        fail("chassis fault");
         return;
     }
 
@@ -125,6 +145,7 @@ void MaixProRingAlignment::update()
         _debug.forwardMm = 0.0F;
         _debug.rightMm = 0.0F;
         _lastObservationMs = 0;
+        _searchReadyMs = now + RING_SEARCH_DWELL_MS;
         return;
     }
 
@@ -143,6 +164,9 @@ void MaixProRingAlignment::update()
             activateStorageRingFallback();
             return;
         }
+
+        if (searchStep(now))
+            return;
 
         if (_lastObservationMs != 0 &&
             now - _lastObservationMs > RING_TARGET_STALE_MS)
@@ -190,9 +214,20 @@ void MaixProRingAlignment::update()
 
         _stableFrames = 0;
         _debug.stableFrames = 0;
+        searchStep(now);
         return;
     }
-    _targetSeen = true;
+    if (!_targetSeen)
+    {
+        // 搜索耗时不占用闭环对准的超时预算。
+        _targetSeen = true;
+        _startedMs = now;
+        const ChassisControl::Pose2D seenPose = _chassis.worldPose();
+        LOGF_INFO("RingAlign",
+                  "RING_SEEN station=%u pose=%.0f,%.0f search_step=%u dx=%d dy=%d q=%u",
+                  static_cast<unsigned>(_station), seenPose.xMm, seenPose.yMm,
+                  _searchStep, detection.dx, detection.dy, detection.quality);
+    }
 
     const int16_t errorDx =
         detection.dx - RING_TARGET_DX_PX;
@@ -214,7 +249,7 @@ void MaixProRingAlignment::update()
         {
             if (!correctWorldPositionFromLandmark())
             {
-                fail();
+                fail("world correction rejected");
                 return;
             }
             stopVision();
@@ -249,7 +284,7 @@ void MaixProRingAlignment::update()
             PRECISE_DRIVE_RPM,
             PRECISE_DRIVE_ACCEL_RPM_PER_S))
     {
-        fail();
+        fail("alignment move rejected");
         return;
     }
 
@@ -280,8 +315,11 @@ MaixProRingAlignment::debugState() const
     return _debug;
 }
 
-void MaixProRingAlignment::fail()
+void MaixProRingAlignment::fail(const char *reason)
 {
+    LOGF_ERROR("RingAlign", "ALIGN_FAIL reason=%s elapsed=%lums seen=%u search_step=%u",
+               reason, static_cast<unsigned long>(millis() - _startedMs),
+               _targetSeen ? 1U : 0U, _searchStep);
     _chassis.stop();
     _chassis.release();
 
@@ -321,6 +359,43 @@ void MaixProRingAlignment::activateStorageRingFallback()
     requestVision();
 }
 
+bool MaixProRingAlignment::searchStep(uint32_t now)
+{
+    using namespace chassis_config;
+    using namespace vision_config;
+
+    if ((_station != Station::RoughProcessing &&
+         _station != Station::Storage) ||
+        _targetSeen ||
+        _searchStep >= SEARCH_RING_COUNT ||
+        now - _startedMs < RING_SEARCH_START_MS ||
+        now < _searchReadyMs)
+        return false;
+
+    const SearchDirection &point = SEARCH_RING[_searchStep];
+    const float targetForwardMm = point.forward * RING_SEARCH_RADIUS_MM;
+    const float targetRightMm = point.right * RING_SEARCH_RADIUS_MM;
+
+    if (!_chassis.moveBodyRelative(
+            targetForwardMm - _searchForwardMm,
+            targetRightMm - _searchRightMm,
+            PRECISE_DRIVE_RPM,
+            PRECISE_DRIVE_ACCEL_RPM_PER_S))
+    {
+        fail("search move rejected");
+        return true;
+    }
+
+    LOGF_INFO("RingAlign", "SEARCH step=%u offset=%.0f,%.0f mm",
+              _searchStep + 1, targetForwardMm, targetRightMm);
+    _searchForwardMm = targetForwardMm;
+    _searchRightMm = targetRightMm;
+    ++_searchStep;
+    _movePending = true;
+    _debug.movePending = true;
+    return true;
+}
+
 bool MaixProRingAlignment::correctWorldPositionFromLandmark()
 {
     using namespace vision_config;
@@ -354,6 +429,9 @@ bool MaixProRingAlignment::correctWorldPositionFromLandmark()
         return false;
 
     _debug.worldCorrectionMm = sqrtf(correctionSquared);
+    LOGF_INFO("RingAlign",
+              "ALIGN_OK pose=%.0f,%.0f target=%.0f,%.0f correction=%.0f,%.0f mm",
+              pose.xMm, pose.yMm, targetX, targetY, errorX, errorY);
     if (!_chassis.correctWorldPosition(targetX, targetY))
         return false;
 

@@ -56,6 +56,10 @@ private:
     bool _allowRingFallback = false;
     bool _ringFallbackActive = false;
     bool _targetSeen = false;
+    uint8_t _searchStep = 0;
+    float _searchForwardMm = 0.0F;
+    float _searchRightMm = 0.0F;
+    uint32_t _searchReadyMs = 0;
     uint8_t _stableFrames = 0;
     uint32_t _startedMs = 0;
     uint32_t _lastObservationMs = 0;
@@ -66,8 +70,9 @@ private:
 
     void requestVision();
     void stopVision();
-    void fail();
+    void fail(const char *reason);
     void activateStorageRingFallback();
+    bool searchStep(uint32_t now);
     bool correctWorldPositionFromLandmark();
     static float clampMagnitude(float value, float limit);
 };

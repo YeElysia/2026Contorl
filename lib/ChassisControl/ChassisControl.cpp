@@ -311,8 +311,6 @@ float ChassisControl::setupTrackSegment(
     _trackDirectionX = directionX;
     _trackDirectionY = directionY;
     _trackTargetCrossMm = directionX * deltaYMm - directionY * deltaXMm;
-    _trackTurnWindowMm =
-        poseMove ? min(POSE_MOVE_TURN_WINDOW_MM, alongLengthMm) : 0.0F;
     _trackTargetYawDeg = poseMove ? turnTargetYawDeg : _holdYawDeg;
     _trackYawTotalDeg =
         fabsf(wrap180(_trackTargetYawDeg - _holdYawDeg));
@@ -324,7 +322,20 @@ float ChassisControl::setupTrackSegment(
     // 进度沿行进轴计，与pathError的along一致；横偏在窗口内另行并入。
     _trackLengthMm = alongLengthMm;
     _trackProfile = {};
-    return configureTrackLimits() * lengthMm;
+    const float wheelStepsPerPathMm = configureTrackLimits();
+    _trackTurnWindowMm =
+        poseMove
+            ? min(
+                  alongLengthMm,
+                  max(
+                      POSE_MOVE_TURN_MIN_WINDOW_MM,
+                      min(
+                          POSE_MOVE_TURN_WINDOW_MM,
+                          rotationWindowMm(
+                              _trackYawTotalDeg,
+                              _trackMaximumSpeedMm))))
+            : 0.0F;
+    return wheelStepsPerPathMm * lengthMm;
 }
 
 uint32_t ChassisControl::segmentTimeoutMs(float wheelSteps) const
@@ -923,6 +934,11 @@ void ChassisControl::updateTranslation()
 
     case TranslationPhase::Driving:
         break;
+
+    case TranslationPhase::PoseHeadingSettling:
+        if (!updatePoseHeadingSettle(_trackTargetYawDeg))
+            return;
+        break;
     }
 
     using namespace chassis_tracking;
@@ -957,9 +973,14 @@ void ChassisControl::updateTranslation()
             startTrackTurn(error.along);
         }
         if (_trackTurnStarted &&
+            !_trackYawReached &&
             fabsf(targetYawErrorDeg) <= ROTATE_TOLERANCE_DEG)
         {
-            _trackYawReached = true;
+            _translationPhase = TranslationPhase::PoseHeadingSettling;
+            _trackPoseStableSamples = 0;
+            _trackPoseStableSinceMs = 0;
+            resetYawStability();
+            return;
         }
     }
 
@@ -1268,8 +1289,43 @@ void ChassisControl::runYawController(float errorDeg)
         rpmToStepsPerSecond(ROTATE_ACCEL_RPM_PER_S));
 }
 
+bool ChassisControl::updatePoseHeadingSettle(float targetYawDeg)
+{
+    driveBodyVelocity(0.0F, 0.0F, 0.0F);
+    const float error = wrap180(targetYawDeg - _yawDeg);
+    if (fabsf(error) > ROTATE_TOLERANCE_DEG)
+    {
+        _translationPhase = TranslationPhase::Driving;
+        _trackTurnStarted = true;
+        _trackYawReached = false;
+        resetYawStability();
+        return true;
+    }
+
+    if (_lastEvaluatedImuSequence == _imuSequence)
+        return false;
+    _lastEvaluatedImuSequence = _imuSequence;
+    if (_trackPoseStableSamples == 0)
+        _trackPoseStableSinceMs = millis();
+    if (_trackPoseStableSamples < UINT8_MAX)
+        ++_trackPoseStableSamples;
+    if (_trackPoseStableSamples < ROTATE_STABLE_SAMPLES ||
+        millis() - _trackPoseStableSinceMs < ROTATE_STABLE_TIME_MS)
+        return false;
+
+    _trackYawReached = true;
+    _trackTurnStarted = false;
+    _holdYawDeg = _trackTargetYawDeg;
+    _translationPhase = TranslationPhase::Driving;
+    updateTrackWheelAcceleration();
+    return true;
+}
+
 float ChassisControl::rotationProfileSpeed(float errorDeg)
 {
+    if (fabsf(errorDeg) <= ROTATE_TOLERANCE_DEG)
+        return 0.0F;
+
     /*
      * 远处按v=√(2a(θ-θl/2))减速，θl=a/K²以内改为v=Kθ，两段在θl处连续。
      * 纯√曲线在零点斜率无穷大，IMU延迟会直接变成过冲和来回震荡。
@@ -1283,9 +1339,13 @@ float ChassisControl::rotationProfileSpeed(float errorDeg)
         errorSteps <= linearSteps
             ? ROTATE_FINAL_GAIN_PER_S * errorSteps
             : sqrtf(2.0F * deceleration * (errorSteps - 0.5F * linearSteps));
+    const float minimumSpeed =
+        fabsf(errorDeg) < ROTATE_SMALL_ANGLE_DEG
+            ? ROTATE_SMALL_MIN_STEPS_PER_S
+            : ROTATE_MIN_STEPS_PER_S;
     const float speed = constrain(
         profileSpeed,
-        ROTATE_MIN_STEPS_PER_S,
+        minimumSpeed,
         rpmToStepsPerSecond(ROTATE_MAX_RPM));
     return slewRotationCommand(copysignf(speed, errorDeg));
 }
@@ -1403,6 +1463,20 @@ uint32_t ChassisControl::estimateRotationTimeoutMs(
         estimatedMs,
         static_cast<float>(MOTION_TIMEOUT_MIN_MS),
         static_cast<float>(MOTION_TIMEOUT_MAX_MS)));
+}
+
+float ChassisControl::rotationWindowMm(
+    float absoluteErrorDeg,
+    float pathSpeedMmPerS)
+{
+    if (absoluteErrorDeg <= ROTATE_TOLERANCE_DEG ||
+        pathSpeedMmPerS <= 0.0F)
+        return POSE_MOVE_TURN_MIN_WINDOW_MM;
+
+    const float rotationSeconds =
+        static_cast<float>(estimateRotationTimeoutMs(absoluteErrorDeg)) *
+        0.001F;
+    return pathSpeedMmPerS * rotationSeconds * POSE_MOVE_TURN_MARGIN_RATIO;
 }
 
 void ChassisControl::bodyToWorld(

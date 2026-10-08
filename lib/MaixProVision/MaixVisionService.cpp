@@ -192,18 +192,8 @@ void MaixVisionService::startTargetSequence(uint32_t now)
         return;
     }
 
-    // 相同目标或涉及圆环时必须经过IDLE，否则相机沿用旧跟踪结果。
-    const bool sameTarget =
-        _cameraMode == _mode && _cameraSelector == _selector;
-    if (sameTarget ||
-        _cameraMode == MODE_RING ||
-        _mode == MODE_RING)
-    {
-        startCommand(CMD_RESET, now);
-        return;
-    }
-
-    startCommand(CMD_SET_TARGET, now);
+    // 相机非IDLE时不直接切换目标：换颜色也必须先RESET，否则可能被拒绝或沿用旧跟踪结果。
+    startCommand(CMD_RESET, now);
 }
 
 void MaixVisionService::startCommand(

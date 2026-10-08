@@ -55,8 +55,8 @@ namespace chassis_config
      */
     constexpr float FORWARD_DISTANCE_SCALE = 1.0f; // 1000.0f / 994.5f; 1.00553
     constexpr float BACKWARD_DISTANCE_SCALE = 1.0f;
-    constexpr float RIGHT_DISTANCE_SCALE = 1.0f; // 1000.0f / 983.0f; 1.01729
-    constexpr float LEFT_DISTANCE_SCALE = 1.0f;
+    constexpr float RIGHT_DISTANCE_SCALE = 1.01f; // 1000.0f / 983.0f; 1.01729
+    constexpr float LEFT_DISTANCE_SCALE = 1.01f;
 
     // 电机正方向。若某个轮子反转，只修改对应项。
     constexpr int8_t MOTOR_SIGN[4] = {-1, 1, -1, 1};
@@ -100,6 +100,8 @@ namespace chassis_config
     constexpr float HEADING_KP_STEPS_PER_S_PER_DEG = 35.0f;
     constexpr float HEADING_MAX_CORRECTION_RATIO = 0.30f;
     constexpr float ROTATE_MIN_STEPS_PER_S = 110.0f;
+    constexpr float ROTATE_SMALL_ANGLE_DEG = 4.0f;
+    constexpr float ROTATE_SMALL_MIN_STEPS_PER_S = 35.0f;
     constexpr float ROTATE_TOLERANCE_DEG = 0.6f;
     constexpr float TRANSLATION_FINAL_HEADING_TOLERANCE_DEG = 0.8f;
 
@@ -124,6 +126,8 @@ namespace chassis_config
      * 窗口前航向不变，所以它同时是整车旋转扫掠的范围。
      */
     constexpr float POSE_MOVE_TURN_WINDOW_MM = 500.0f;
+    constexpr float POSE_MOVE_TURN_MIN_WINDOW_MM = 180.0f;
+    constexpr float POSE_MOVE_TURN_MARGIN_RATIO = 1.35f;
     /*
      * 途经点连续平移：第一段参考距途经点还剩这段距离时第二段起步，
      * 两段S曲线叠加，途经点不停车。直角拐角内切约0.28倍该值

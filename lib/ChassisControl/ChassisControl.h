@@ -202,6 +202,7 @@ private:
     enum class TranslationPhase : uint8_t
     {
         Driving,
+        PoseHeadingSettling,
         Braking,
         HeadingSettling
     };
@@ -290,6 +291,8 @@ private:
     uint32_t _stableSinceMs = 0;
     uint32_t _motionStartMs = 0;
     uint32_t _motionTimeoutMs = 0;
+    uint32_t _trackPoseStableSinceMs = 0;
+    uint8_t _trackPoseStableSamples = 0;
 
     bool updateImu();
     float predictedYawDeg() const;
@@ -319,6 +322,7 @@ private:
         float turnTargetYawDeg);
     uint32_t segmentTimeoutMs(float wheelSteps) const;
     void updateTrackWheelAcceleration();
+    bool updatePoseHeadingSettle(float targetYawDeg);
     void startNextTrackSegment();
     void driveBodyVelocity(
         float forwardMmPerS,
@@ -346,6 +350,7 @@ private:
         float maximumSpeed,
         float maximumAcceleration);
     static uint32_t estimateRotationTimeoutMs(float absoluteErrorDeg);
+    static float rotationWindowMm(float absoluteErrorDeg, float pathSpeedMmPerS);
     static float wrap180(float angleDeg);
     static float rpmToStepsPerSecond(float rpm);
 };
