@@ -303,6 +303,19 @@ bool MechanismTaskExecutor::prepareForTravel(
     return true;
 }
 
+bool MechanismTaskExecutor::returnToInitialPose()
+{
+    if (!ready() || _result == AsyncResult::Running)
+        return false;
+
+    _result = AsyncResult::Running;
+    _phase = TaskPhase::Initializing;
+    _fault = "";
+    _preparedStorageSlot = -1;
+    loadInitializationAction();
+    return true;
+}
+
 bool MechanismTaskExecutor::start(
     StationTask task,
     uint8_t round,
@@ -665,6 +678,7 @@ void MechanismTaskExecutor::clearAction()
     _lastSharedBusPollMs = 0;
     _storageToRoughFastProfile = false;
     _pickupToTrayFastProfile = false;
+    _secondLayerFastBase = false;
 }
 
 void MechanismTaskExecutor::addStep(
@@ -725,7 +739,8 @@ void MechanismTaskExecutor::appendStep(
         0,
         0,
         0,
-        0};
+        0,
+        false};
 }
 
 bool MechanismTaskExecutor::lastGroupContains(StepKind kind) const
@@ -781,7 +796,8 @@ void MechanismTaskExecutor::addLiftThenRingTransfer(
     float baseTarget,
     float liftTarget,
     float extensionTarget,
-    int8_t storageSlotToPrepare)
+    int8_t storageSlotToPrepare,
+    bool placementStallIsArrival)
 {
     /*
      * 动作一：只有升降轴抬到指定安全高度。Home点使用
@@ -794,15 +810,18 @@ void MechanismTaskExecutor::addLiftThenRingTransfer(
      * 一次到达圆环完整点位。
      */
     addStep(StepKind::Lift, liftTarget);
+    _steps[_stepCount - 1].stallIsArrival = placementStallIsArrival;
     const uint8_t ringTransferGroup = _steps[_stepCount - 1].group;
     appendStep(
         StepKind::RotateBase,
         baseTarget,
         ringTransferGroup);
+    _steps[_stepCount - 1].stallIsArrival = placementStallIsArrival;
     appendStep(
         StepKind::Extend,
         extensionTarget,
         ringTransferGroup);
+    _steps[_stepCount - 1].stallIsArrival = placementStallIsArrival;
     if (storageSlotToPrepare >= 0)
     {
         appendStoragePreparation(
@@ -926,11 +945,11 @@ void MechanismTaskExecutor::loadInitializationAction()
         TRAY_SLOT_ANGLE[_initialStorageSlot]);
     LOGF_DEBUG("Mechanism", "  - Step 4: Storage to slot %d (%.1f deg)", 
               _initialStorageSlot, TRAY_SLOT_ANGLE[_initialStorageSlot]);
-    // 初始化时夹爪内没有物料，只按角度确认空载闭合。
+    // 夹爪常用位为张开，初始化/收纳姿态也保持张开，闭合角度只用于夹取。
     addConcurrentStep(
-        StepKind::CloseGripperUnloaded,
-        GRIPPER_CLOSE_ANGLE);
-    LOGF_DEBUG("Mechanism", "  - Step 5: Close gripper to %.1f deg", GRIPPER_CLOSE_ANGLE);
+        StepKind::OpenGripper,
+        GRIPPER_OPEN_ANGLE);
+    LOGF_DEBUG("Mechanism", "  - Step 5: Open gripper to %.1f deg", GRIPPER_OPEN_ANGLE);
     LOG_INFO("Mechanism", "Init action loaded, starting execution...");
 }
 
@@ -1601,6 +1620,8 @@ void MechanismTaskExecutor::loadStorageToRingAction(
     _storageToRoughFastProfile =
         _phase == TaskPhase::RoughPlacing ||
         (_phase == TaskPhase::FinalStoring && stackLevel == 0);
+    _secondLayerFastBase =
+        _phase == TaskPhase::FinalStoring && stackLevel > 0;
 
     if (!pickupPoseAlreadyPrepared)
     {
@@ -1646,7 +1667,9 @@ void MechanismTaskExecutor::loadStorageToRingAction(
          */
         addStep(StepKind::Lift, LIFT_HOME);
         addStep(StepKind::Extend, pose.extension);
+        _steps[_stepCount - 1].stallIsArrival = true;
         addStep(StepKind::RotateBase, pose.base);
+        _steps[_stepCount - 1].stallIsArrival = true;
         const int8_t nextSlot = nextAvailableTraySlot();
         if (nextSlot >= 0)
         {
@@ -1655,6 +1678,7 @@ void MechanismTaskExecutor::loadStorageToRingAction(
                 _steps[_stepCount - 1].group);
         }
         addStep(StepKind::Lift, placementLiftTarget);
+        _steps[_stepCount - 1].stallIsArrival = true;
     }
     else
     {
@@ -1663,7 +1687,8 @@ void MechanismTaskExecutor::loadStorageToRingAction(
             pose.base,
             placementLiftTarget,
             pose.extension,
-            nextAvailableTraySlot());
+            nextAvailableTraySlot(),
+            true);
     }
 
     // 各轴已按本层对应路径到达圆环完整点位，直接放料。
@@ -1673,12 +1698,19 @@ void MechanismTaskExecutor::loadStorageToRingAction(
      * 圆环放料后先竖直脱离物料，再开始旋转或伸缩返回。
      * 升降坐标越小位置越高，因此上抬量从放置目标中减去。
      */
-    addStep(
-        StepKind::Lift,
-        max(
-            LIFT_HOME,
-            placementLiftTarget -
-                RING_PLACEMENT_RELEASE_LIFT));
+    // 第二层放置后紧接着升到Home，直接一次升到位，不再单独上抬一段。
+    const bool secondLayerReturnsToHome =
+        retractAfterPlacement && stackLevel > 0 &&
+        _phase != TaskPhase::RoughPlacing;
+    if (!secondLayerReturnsToHome)
+    {
+        addStep(
+            StepKind::Lift,
+            max(
+                LIFT_HOME,
+                placementLiftTarget -
+                    RING_PLACEMENT_RELEASE_LIFT));
+    }
 
     /*
      * 粗加工最后一件放下后，下一动作会直接取回第一件。此时不再
@@ -1714,11 +1746,18 @@ void MechanismTaskExecutor::loadStorageToRingAction(
 void MechanismTaskExecutor::loadRingToStorageAction(
     uint8_t traySlot,
     const RingPose &pose,
-    bool directRingSwitch)
+    bool directRingSwitch,
+    bool rotateTrayFirst)
 {
     clearAction();
     // 普通取回从储料盘出发；第三件放置后的首次取回属于圆环直切。
     _storageToRoughFastProfile = !directRingSwitch;
+
+    // 载物盘先单独转到目标槽位，到位后机械臂才开始动作。
+    const bool trayRotatedFirst =
+        rotateTrayFirst && !storageSlotPrepared(traySlot);
+    if (trayRotatedFirst)
+        addStep(StepKind::RotateStorage, TRAY_SLOT_ANGLE[traySlot]);
 
     uint8_t ringArrivalGroup = 0;
     if (directRingSwitch)
@@ -1748,7 +1787,8 @@ void MechanismTaskExecutor::loadRingToStorageAction(
     }
 
     // 圆环抓取使用普通开度，载物盘预旋转也在赴圆环时完成。
-    appendStoragePreparation(traySlot, ringArrivalGroup);
+    if (!trayRotatedFirst)
+        appendStoragePreparation(traySlot, ringArrivalGroup);
     appendStep(
         StepKind::OpenGripper,
         GRIPPER_OPEN_ANGLE,
@@ -1851,7 +1891,6 @@ bool MechanismTaskExecutor::updateActionStep(ActionStep &step)
     case StepKind::RotateStorage:
     case StepKind::OpenGripper:
     case StepKind::OpenGripperMax:
-    case StepKind::CloseGripperUnloaded:
     case StepKind::CloseGripper:
     case StepKind::CloseGripperGrasp:
         return updateServoStep(step);
@@ -1913,6 +1952,13 @@ bool MechanismTaskExecutor::issueStepperCommand(
         {
             velocity = PICKUP_TO_TRAY_BASE_SPEED;
             acceleration = PICKUP_TO_TRAY_BASE_ACCELERATION;
+        }
+
+        if (_secondLayerFastBase &&
+            step.kind == StepKind::RotateBase)
+        {
+            velocity = SECOND_LAYER_BASE_SPEED;
+            acceleration = SECOND_LAYER_BASE_ACCELERATION;
         }
 
         if (step.kind == StepKind::RotateBaseRoughCalibration &&
@@ -2074,9 +2120,42 @@ bool MechanismTaskExecutor::updateStepperStep(
         return false;
     }
 
+    if (step.stallIsArrival &&
+        now - step.startedMs >= RING_PLACEMENT_ARRIVAL_TIMEOUT_MS)
+    {
+        const bool isBase = &motor == &_base;
+        const uint8_t motorId =
+            &motor == &_lift ? LIFT_STEPPER_ID
+            : &motor == &_extension ? EXTENSION_STEPPER_ID
+                                    : BASE_STEPPER_ID;
+        TTL_Protocol &protocol = isBase ? _baseProtocol : _stepperProtocol;
+        protocol.Emm_V5_Stop_Now(motorId, false);
+        if (!isBase)
+            _sharedPollOwner = nullptr;
+        LOGF_WARNING(
+            "Mechanism",
+            "Ring placement motor=%u no arrival feedback after %lums, treated as in position",
+            static_cast<unsigned>(motorId),
+            static_cast<unsigned long>(now - step.startedMs));
+        return true;
+    }
+
     if (now - step.startedMs >= STEPPER_TIMEOUT_MS)
     {
-        LOGF_ERROR("Mechanism", "Stepper timeout: %s", stepperTimeoutMessage(motor));
+        LOGF_ERROR(
+            "Mechanism",
+            "Stepper timeout: %s kind=%d target=%.1f en=%d onPos=%d lock=%d protect=%d ask=%d owner=%s",
+            stepperTimeoutMessage(motor),
+            static_cast<int>(step.kind),
+            static_cast<double>(step.target),
+            motor.enstate ? 1 : 0,
+            motor.onPos_state ? 1 : 0,
+            motor.locked_state ? 1 : 0,
+            motor.loPro_state ? 1 : 0,
+            motor.Ask_State ? 1 : 0,
+            _sharedPollOwner == nullptr
+                ? "none"
+                : (_sharedPollOwner == &_lift ? "lift" : "extension"));
         fail(stepperTimeoutMessage(motor));
         return false;
     }
@@ -2127,6 +2206,30 @@ bool MechanismTaskExecutor::updateStepperStep(
 
     if (motor.locked_state || motor.loPro_state)
     {
+        if (step.stallIsArrival)
+        {
+            // 放置圆环时升降/伸缩/底座任一轴收到堵转反馈：判定为顶到位，视为到位。
+            const bool isBase = &motor == &_base;
+            const uint8_t motorId =
+                &motor == &_lift ? LIFT_STEPPER_ID
+                : &motor == &_extension ? EXTENSION_STEPPER_ID
+                                        : BASE_STEPPER_ID;
+            TTL_Protocol &protocol = isBase ? _baseProtocol : _stepperProtocol;
+            protocol.Emm_V5_Stop_Now(motorId, false);
+            if (motor.loPro_state)
+                protocol.Emm_V5_Reset_Clog_Pro(motorId);
+            if (!isBase)
+                _sharedPollOwner = nullptr;
+            LOGF_WARNING(
+                "Mechanism",
+                "Ring placement stall feedback motor=%u (lock=%d protect=%d) after %lums, treated as in position",
+                static_cast<unsigned>(motorId),
+                motor.locked_state ? 1 : 0,
+                motor.loPro_state ? 1 : 0,
+                static_cast<unsigned long>(now - step.startedMs));
+            return true;
+        }
+
         if (step.faultFeedbackCount < STEPPER_FAULT_CONFIRM_COUNT)
             ++step.faultFeedbackCount;
 
@@ -2162,7 +2265,14 @@ bool MechanismTaskExecutor::pollStepperState(
         if (_sharedPollOwner != nullptr &&
             _sharedPollOwner != &motor)
         {
-            return false;
+            // 占用方的步骤已结束时没人再清理它的残留查询，超时后强制回收总线。
+            if (now - _sharedPollOwnerSinceMs <
+                STEPPER_QUERY_RESPONSE_TIMEOUT_MS * 2)
+            {
+                return false;
+            }
+            _sharedPollOwner->recDate_Clear();
+            _sharedPollOwner = nullptr;
         }
 
         /*
@@ -2185,7 +2295,10 @@ bool MechanismTaskExecutor::pollStepperState(
             return false;
 
         if (_sharedPollOwner == nullptr)
+        {
             _sharedPollOwner = &motor;
+            _sharedPollOwnerSinceMs = now;
+        }
 
         _lastSharedBusPollMs = now;
         const bool responsePending = motor.Ask_State;
@@ -2250,7 +2363,6 @@ void MechanismTaskExecutor::issueServoStep(ActionStep &step)
             GRIPPER_OPEN_INTERVAL_MS,
             0);
         break;
-    case StepKind::CloseGripperUnloaded:
     case StepKind::CloseGripper:
     case StepKind::CloseGripperGrasp:
         _gripperServo.setAngle(
@@ -2379,10 +2491,13 @@ void MechanismTaskExecutor::onActionCompleted()
     case TaskPhase::RoughRetrieving:
         if (selectNextAvailableItem())
         {
+            // 第一件放回载物盘后，等载物盘转到2号位再动机械臂。
             loadRingToStorageAction(
                 _itemIndex + 1,
                 ROUGH_RING_POSES[
-                    _batch.roughPositions[_itemIndex]]);
+                    _batch.roughPositions[_itemIndex]],
+                false,
+                _itemIndex + 1 == 2);
         }
         else
         {

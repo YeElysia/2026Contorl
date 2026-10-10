@@ -62,6 +62,18 @@ namespace mission_routes
         {field_config::UPPER_RIGHT_START.xMm,
          field_config::UPPER_RIGHT_START.yMm},
         -180.0F};
+    // 回启停区停车点的标定偏移：只移动路线终点，不改变启停区基准点。
+    // 世界坐标：+x为初始左侧，+y为初始车头方向。
+    constexpr float LOWER_HOME_STOP_OFFSET_X_MM = -50.0F;
+    constexpr float LOWER_HOME_STOP_OFFSET_Y_MM = -10.0F;
+    constexpr float UPPER_HOME_STOP_OFFSET_X_MM = -50.0F;
+    constexpr float UPPER_HOME_STOP_OFFSET_Y_MM = 10.0F;
+    constexpr FieldPoint LOWER_HOME_STOP = {
+        LOWER_HOME_ANCHOR.position.xMm + LOWER_HOME_STOP_OFFSET_X_MM,
+        LOWER_HOME_ANCHOR.position.yMm + LOWER_HOME_STOP_OFFSET_Y_MM};
+    constexpr FieldPoint UPPER_HOME_STOP = {
+        UPPER_HOME_ANCHOR.position.xMm + UPPER_HOME_STOP_OFFSET_X_MM,
+        UPPER_HOME_ANCHOR.position.yMm + UPPER_HOME_STOP_OFFSET_Y_MM};
     constexpr FieldPose MATERIAL_ANCHOR = {{1200.0F, 2100.0F}, 90.0F};
     // 取完料后的归位转向点：x与原料区轴线一致，y比取料锚点小以避开物料盘。
     constexpr FieldPoint MATERIAL_TURN_POINT = {
@@ -77,6 +89,15 @@ namespace mission_routes
              ROUGH_APPROACH_OFFSET_Y_MM},
         -90.0F};
     constexpr FieldPose STORAGE_ANCHOR = {{2040.0F, 1220.0F}, -180.0F};
+    // 粗加工区->暂存区漂移到位点的标定偏移：只移动该漂移终点，不改变
+    // STORAGE_ANCHOR（其他路线与测试共用）和对准成功后重写的世界坐标，
+    // 也不影响原料区->粗加工区路线。
+    constexpr float STORAGE_APPROACH_OFFSET_X_MM = 0.0F;
+    constexpr float STORAGE_APPROACH_OFFSET_Y_MM = 0.0F;
+    constexpr FieldPose STORAGE_DRIFT_TARGET = {
+        {STORAGE_ANCHOR.position.xMm + STORAGE_APPROACH_OFFSET_X_MM,
+         STORAGE_ANCHOR.position.yMm + STORAGE_APPROACH_OFFSET_Y_MM},
+        STORAGE_ANCHOR.yawDeg};
 
     // 原料区到粗加工区沿世界-y方向行驶，车头需先转向-180度。
     constexpr float MATERIAL_TO_ROUGH_TRAVEL_YAW_DEG = -180.0F;
@@ -105,7 +126,7 @@ namespace mission_routes
      * 完成旋转后再沿下一工位轴线进入目标区，避免绕行场地中心。
      */
     constexpr FieldPoint ROUGH_STORAGE_CORNER = {
-        STORAGE_ANCHOR.position.xMm,
+        STORAGE_DRIFT_TARGET.position.xMm,
         ROUGH_ANCHOR.position.yMm};
     constexpr FieldPoint STORAGE_MATERIAL_CORNER = {
         STORAGE_ANCHOR.position.xMm,
@@ -120,6 +141,9 @@ namespace mission_routes
         field_config::hasRotationClearance(
             ROUGH_STORAGE_CORNER.xMm,
             ROUGH_STORAGE_CORNER.yMm) &&
+            field_config::hasRotationClearance(
+                STORAGE_DRIFT_TARGET.position.xMm,
+                STORAGE_DRIFT_TARGET.position.yMm) &&
             field_config::hasRotationClearance(
                 STORAGE_MATERIAL_CORNER.xMm,
                 STORAGE_MATERIAL_CORNER.yMm),
@@ -156,6 +180,7 @@ namespace mission_routes
     constexpr RouteAction SCAN_TO_MATERIAL[] = {
         routeRotateTo(MATERIAL_ANCHOR.yawDeg),
         fastTo(MATERIAL_ANCHOR.position),
+        routeRotateTo(MATERIAL_ANCHOR.yawDeg),
     };
 
     // 原料区原地转-180度后一条指令到粗加工区：沿原料区x轴线快速直行，
@@ -164,18 +189,23 @@ namespace mission_routes
         fastTo(MATERIAL_TURN_POINT),
         routeRotateTo(MATERIAL_TO_ROUGH_TRAVEL_YAW_DEG),
         driftTo(ROUGH_ANCHOR),
+        routeRotateTo(ROUGH_ANCHOR.yawDeg),
     };
 
+    // 粗加工区沿x轴线直行到地图角点，停车原地转到暂存区航向，
+    // 再沿暂存区轴线直行进站。
     constexpr RouteAction ROUGH_TO_STORAGE[] = {
         fastTo(ROUGH_STORAGE_CORNER),
         routeRotateTo(STORAGE_ANCHOR.yawDeg),
-        fastTo(STORAGE_ANCHOR.position),
+        fastTo(STORAGE_DRIFT_TARGET.position),
+        routeRotateTo(STORAGE_ANCHOR.yawDeg),
     };
 
     constexpr RouteAction STORAGE_TO_MATERIAL_SECOND[] = {
         fastTo(STORAGE_MATERIAL_CORNER),
         routeRotateTo(MATERIAL_ANCHOR.yawDeg),
         fastTo(MATERIAL_ANCHOR.position),
+        routeRotateTo(MATERIAL_ANCHOR.yawDeg),
     };
 
     /*
@@ -185,13 +215,13 @@ namespace mission_routes
      */
     constexpr RouteAction STORAGE_TO_LOWER_HOME[] = {
         throughTo(HOME_CENTERLINE),
-        fastTo(LOWER_HOME_ANCHOR.position),
+        fastTo(LOWER_HOME_STOP),
     };
 
     // 暂存区 -> 右上启停区，与右下路线共用右侧中心线拐点。
     constexpr RouteAction STORAGE_TO_UPPER_HOME[] = {
         throughTo(HOME_CENTERLINE),
-        fastTo(UPPER_HOME_ANCHOR.position),
+        fastTo(UPPER_HOME_STOP),
     };
 
     constexpr RouteDefinition ROUTE_TO_SCAN = routeDefinition(TO_SCAN);

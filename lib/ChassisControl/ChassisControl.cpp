@@ -934,11 +934,6 @@ void ChassisControl::updateTranslation()
 
     case TranslationPhase::Driving:
         break;
-
-    case TranslationPhase::PoseHeadingSettling:
-        if (!updatePoseHeadingSettle(_trackTargetYawDeg))
-            return;
-        break;
     }
 
     using namespace chassis_tracking;
@@ -976,11 +971,11 @@ void ChassisControl::updateTranslation()
             !_trackYawReached &&
             fabsf(targetYawErrorDeg) <= ROTATE_TOLERANCE_DEG)
         {
-            _translationPhase = TranslationPhase::PoseHeadingSettling;
-            _trackPoseStableSamples = 0;
-            _trackPoseStableSinceMs = 0;
-            resetYawStability();
-            return;
+            // 转到容差内直接转入航向保持，不停车确认。
+            _trackYawReached = true;
+            _trackTurnStarted = false;
+            _holdYawDeg = _trackTargetYawDeg;
+            updateTrackWheelAcceleration();
         }
     }
 
@@ -1287,38 +1282,6 @@ void ChassisControl::runYawController(float errorDeg)
     _driver.setVelocities(
         speeds,
         rpmToStepsPerSecond(ROTATE_ACCEL_RPM_PER_S));
-}
-
-bool ChassisControl::updatePoseHeadingSettle(float targetYawDeg)
-{
-    driveBodyVelocity(0.0F, 0.0F, 0.0F);
-    const float error = wrap180(targetYawDeg - _yawDeg);
-    if (fabsf(error) > ROTATE_TOLERANCE_DEG)
-    {
-        _translationPhase = TranslationPhase::Driving;
-        _trackTurnStarted = true;
-        _trackYawReached = false;
-        resetYawStability();
-        return true;
-    }
-
-    if (_lastEvaluatedImuSequence == _imuSequence)
-        return false;
-    _lastEvaluatedImuSequence = _imuSequence;
-    if (_trackPoseStableSamples == 0)
-        _trackPoseStableSinceMs = millis();
-    if (_trackPoseStableSamples < UINT8_MAX)
-        ++_trackPoseStableSamples;
-    if (_trackPoseStableSamples < ROTATE_STABLE_SAMPLES ||
-        millis() - _trackPoseStableSinceMs < ROTATE_STABLE_TIME_MS)
-        return false;
-
-    _trackYawReached = true;
-    _trackTurnStarted = false;
-    _holdYawDeg = _trackTargetYawDeg;
-    _translationPhase = TranslationPhase::Driving;
-    updateTrackWheelAcceleration();
-    return true;
 }
 
 float ChassisControl::rotationProfileSpeed(float errorDeg)

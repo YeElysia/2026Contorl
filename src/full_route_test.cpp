@@ -50,26 +50,43 @@ constexpr StartZone TEST_START_ZONE = StartZone::UpperRight;
 #else
 constexpr StartZone TEST_START_ZONE = StartZone::LowerRight;
 #endif
-// 分步测试，每次调试串口发送'n'或点击PB9前进一步：
-//   1) 启停区 -> 原料区 -> 粗加工区，到达后停车；
-//   2) 机械臂转到圆环识别位，视觉对准粗加工区圆环，完成后停车；
-//   3) 开到暂存区，停车。
+// 调试串口发送'n'或点击PB9启动后全程自动运行两轮：
+//   启停区 -> 扫描区 -> 原料区 -> 粗加工区(对准) -> 暂存区(对准)
+//   -> 原料区 -> 粗加工区(对准) -> 暂存区(对准) -> 启停区 -> 停车。
+// prepare的路线从起步就并行让机械臂转到该路线终点的运输位（与正式流程一致），
+// alignAtEnd的路线到站后等机械臂就位再启动圆环对准，成功后自动开始下一段。
+// 第二轮暂存区的正式对准需要物料颜色计划，本测试两轮都对准基准圆环。
 constexpr char NEXT_COMMAND = 'n';
 
 struct Leg
 {
     const char *name;
     RouteDefinition route;
+    bool prepare;
+    TravelDestination travel;
+    bool alignAtEnd;
+    Station station;
 };
 
 constexpr Leg LEGS[] = {
-    {"HOME->SCAN", ROUTE_TO_SCAN},
-    {"SCAN->MATERIAL#1", ROUTE_SCAN_TO_MATERIAL},
-    {"MATERIAL->ROUGH#1", ROUTE_MATERIAL_TO_ROUGH[0]},
-    {"ROUGH->STORAGE#1", ROUTE_ROUGH_TO_STORAGE[0]},
+    {"HOME->SCAN", ROUTE_TO_SCAN,
+     false, TravelDestination::Scan, false, Station::Material},
+    {"SCAN->MATERIAL#1", ROUTE_SCAN_TO_MATERIAL,
+     false, TravelDestination::Material, false, Station::Material},
+    {"MATERIAL->ROUGH#1", ROUTE_MATERIAL_TO_ROUGH[0],
+     true, TravelDestination::RoughProcessing, true, Station::RoughProcessing},
+    {"ROUGH->STORAGE#1", ROUTE_ROUGH_TO_STORAGE[0],
+     true, TravelDestination::Storage, true, Station::Storage},
+    {"STORAGE->MATERIAL#2", ROUTE_STORAGE_TO_MATERIAL_SECOND,
+     true, TravelDestination::Material, false, Station::Material},
+    {"MATERIAL->ROUGH#2", ROUTE_MATERIAL_TO_ROUGH[1],
+     true, TravelDestination::RoughProcessing, true, Station::RoughProcessing},
+    {"ROUGH->STORAGE#2", ROUTE_ROUGH_TO_STORAGE[1],
+     true, TravelDestination::Storage, true, Station::Storage},
+    {"STORAGE->HOME", storageToHomeRoute(TEST_START_ZONE),
+     true, TravelDestination::Home, false, Station::Material},
 };
 constexpr size_t LEG_COUNT = sizeof(LEGS) / sizeof(LEGS[0]);
-constexpr size_t ROUGH_LEG_COUNT = 3;
 
 HardwareSerial serialImu(
     chassis_config::IMU_RX_PIN,
@@ -111,10 +128,8 @@ enum class TestState : uint8_t
     WaitingForImu,
     WaitingForStart,
     Running,
-    AtRough,
     PreparingView,
     Aligning,
-    Aligned,
     Done,
     Failed
 };
@@ -138,14 +153,10 @@ const char *stateName()
         return "READY";
     case TestState::Running:
         return "RUNNING(ignored)";
-    case TestState::AtRough:
-        return "AT_ROUGH";
     case TestState::PreparingView:
         return "PREP_VIEW(ignored)";
     case TestState::Aligning:
         return "ALIGNING(ignored)";
-    case TestState::Aligned:
-        return "ALIGNED";
     case TestState::Done:
         return "DONE";
     case TestState::Failed:
@@ -209,6 +220,8 @@ void printPose(const char *label, float xMm, float yMm, float yawDeg)
     serialDebug.print(yawDeg, 2);
 }
 
+void enterFault(const char *message);
+
 void startLeg()
 {
     const Leg &leg = LEGS[legIndex];
@@ -219,6 +232,19 @@ void startLeg()
         serialDebug.print(leg.name);
         serialDebug.print(" fault=");
         serialDebug.println(chassis.faultMessage());
+        return;
+    }
+
+    // 收尾的回启停区一段，机械臂回到上电初始位，而不是普通运输位。
+    const bool armAccepted =
+        !leg.prepare ||
+        (leg.travel == TravelDestination::Home
+             ? mechanism.returnToInitialPose()
+             : mechanism.prepareForTravel(leg.travel));
+    if (!armAccepted)
+    {
+        routeExecutor.cancel();
+        enterFault("mechanism preparation rejected");
         return;
     }
 
@@ -269,34 +295,40 @@ void reportStation()
     serialDebug.println(chassis.yawDeg(), 2);
 }
 
-void onLegFinished()
+void advanceLeg()
 {
-    reportStation();
     ++legIndex;
-
-    if (legIndex == ROUGH_LEG_COUNT)
-    {
-        testState = TestState::AtRough;
-        serialDebug.println(
-            "ROUTE AT_ROUGH, send 'n' to rotate arm to ring view and align");
-        return;
-    }
 
     if (legIndex >= LEG_COUNT)
     {
         testState = TestState::Done;
         serialDebug.print("ROUTE DONE total=");
         serialDebug.print(millis() - runStartedMs);
-        serialDebug.println("ms, stopped at STORAGE; return car to start before sending 'n' again");
+        serialDebug.println("ms, stopped at HOME, arm at initial pose; return car to start before sending 'n' again");
         return;
     }
 
     startLeg();
 }
 
+void onLegFinished()
+{
+    reportStation();
+
+    if (LEGS[legIndex].prepare)
+    {
+        testState = TestState::PreparingView;
+        serialDebug.println("ROUTE WAIT arm in travel pose");
+        return;
+    }
+
+    advanceLeg();
+}
+
 void enterFault(const char *message)
 {
     chassis.stop();
+    routeExecutor.cancel();
     alignment.cancel();
     mechanism.cancel();
     testState = TestState::Failed;
@@ -307,23 +339,6 @@ void enterFault(const char *message)
     serialDebug.print(" ");
     printPose("odom", pose.xMm, pose.yMm, pose.yawDeg);
     serialDebug.println(", reset board to retry");
-}
-
-// 第二步：机械臂转到圆环识别位，然后视觉对准粗加工区圆环。
-void startViewPrepare()
-{
-    if (!mechanism.ready() || mechanism.result() == AsyncResult::Running)
-    {
-        serialDebug.println("ROUTE WAIT mechanism not ready, send 'n' again");
-        return;
-    }
-    if (!mechanism.prepareForTravel(TravelDestination::RoughProcessing))
-    {
-        enterFault("mechanism preparation rejected");
-        return;
-    }
-    testState = TestState::PreparingView;
-    serialDebug.println("ROUTE ARM -> ring view position");
 }
 
 void printAlignReport()
@@ -387,8 +402,14 @@ void updateAlignStage()
         if (mechanism.result() != AsyncResult::Succeeded)
             return;
 
+        if (!LEGS[legIndex].alignAtEnd)
+        {
+            advanceLeg();
+            return;
+        }
+
         AlignmentRequest request;
-        request.station = Station::RoughProcessing;
+        request.station = LEGS[legIndex].station;
         request.round = 0;
         if (!alignment.start(request))
         {
@@ -400,11 +421,13 @@ void updateAlignStage()
     }
     else if (alignment.result() == AsyncResult::Succeeded)
     {
-        testState = TestState::Aligned;
         const ChassisControl::Pose2D pose = chassis.worldPose();
         serialDebug.print("ROUTE ALIGNED ");
+        serialDebug.print(LEGS[legIndex].name);
+        serialDebug.print(" ");
         printPose("odom", pose.xMm, pose.yMm, pose.yawDeg);
-        serialDebug.println(", stopped; send 'n' to drive to STORAGE");
+        serialDebug.println();
+        advanceLeg();
     }
     else if (alignment.result() == AsyncResult::Failed)
     {
@@ -502,26 +525,18 @@ void loop()
 
     case TestState::Running:
         takeNext();
-        if (routeExecutor.result() == AsyncResult::Succeeded)
+        if (mechanism.result() == AsyncResult::Failed)
+            enterFault(mechanism.faultMessage());
+        else if (routeExecutor.result() == AsyncResult::Succeeded)
             onLegFinished();
         else if (routeExecutor.result() == AsyncResult::Failed)
             onLegFailed();
-        break;
-
-    case TestState::AtRough:
-        if (takeNext())
-            startViewPrepare();
         break;
 
     case TestState::PreparingView:
     case TestState::Aligning:
         takeNext();
         updateAlignStage();
-        break;
-
-    case TestState::Aligned:
-        if (takeNext())
-            startLeg();
         break;
 
     case TestState::Failed:

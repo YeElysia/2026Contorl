@@ -105,6 +105,11 @@ namespace mechanism_config
     // 转盘取料后底座转回载物盘的加速度档，与上面的速度配套。
     constexpr uint8_t PICKUP_TO_TRAY_BASE_ACCELERATION = 230;
 
+    // 暂存区第二层放置：底座转向圆环和放料后转回载物盘的速度，两段共用。
+    constexpr uint16_t SECOND_LAYER_BASE_SPEED = 330;
+    // 暂存区第二层底座转动的加速度档，与上面的速度配套。
+    constexpr uint8_t SECOND_LAYER_BASE_ACCELERATION = 200;
+
     /*
      * 粗加工圆环直接回到储料盘2770时使用的三组速度。
      * 参数保持实车当前值，使三个圆环的直接回程时间接近升降时间。
@@ -123,7 +128,7 @@ namespace mechanism_config
     // -------------------- 舵机参数（以new_project为准） --------------------
     // 夹爪普通张开角度：圆环/载物盘取放、初始化后常用的张开位。
     constexpr float GRIPPER_OPEN_ANGLE = 80.0F;
-    // 夹爪闭合角度：夹住物料（及空载初始化）时的目标角度，数值越大夹得越紧。
+    // 夹爪闭合角度：仅夹住物料时的目标角度，数值越大夹得越紧；初始化和收纳不使用。
     constexpr float GRIPPER_CLOSE_ANGLE = 105.0F;
     // 夹爪最大张开角度：赴原料盘/工位视觉对准时使用，给相机和物料留最大空间；同时参与舵机角度范围设置。
     constexpr float GRIPPER_OPEN_MAX_ANGLE = 50.0F;
@@ -186,7 +191,7 @@ namespace mechanism_config
     // 转盘（原料盘）夹取高度：视觉对准完成后下降到此处夹料。
     constexpr float LIFT_TURNTABLE = 600.0F;
     // 载物盘处取放料时的升降高度；与EXTENSION_TRAY_TRANSFER、BASE_TRAY_TRANSFER构成固定交接坐标。
-    constexpr float LIFT_TRAY_TRANSFER = 320.0F;
+    constexpr float LIFT_TRAY_TRANSFER = 300.0F;
     // 从圆环夹紧物料后先竖直上抬的距离，脱离物料后才允许返回储料盘。
     constexpr float RING_PICKUP_RELEASE_LIFT = 100.0F;
     // 粗加工第三件放完后直切第一个圆环时的安全高度。
@@ -230,9 +235,12 @@ namespace mechanism_config
      */
     constexpr RingPose ROUGH_RING_POSES[4] = {
         {BASE_TRAY_TRANSFER, 0.0F, 0.0F},
-        {2226.0F, 1325.0F, 760.0F},  // 1号圆环
-        {1823.0F, 1360.0F, 1605.0F}, // 2号圆环
-        {1330.0F, 1400.0F, 1225.0F}, // 3号圆环
+        // {2226.0F, 1325.0F, 760.0F},  // 1号圆环
+        // {1823.0F, 1360.0F, 1605.0F}, // 2号圆环
+        // {1330.0F, 1400.0F, 1225.0F}, // 3号圆环
+        {2224.0F, 1325.0F, 760.0F},  // 1号圆环
+        {1823.0F, 1350.0F, 1605.0F}, // 2号圆环
+        {1320.0F, 1370.0F, 1245.0F}, // 3号圆环
     };
 
     /*
@@ -241,12 +249,12 @@ namespace mechanism_config
      */
     constexpr RingPose FINAL_STORAGE_RING_POSES[4] = {
         {BASE_TRAY_TRANSFER, 0.0F, 0.0F},
-        {2233.0F, 1310.0F, 795.0F},  // 1号圆环
-        {1817.0F, 1340.0F, 1605.0F}, // 2号圆环
+        {2230.0F, 1310.0F, 765.0F},  // 1号圆环
+        {1822.0F, 1340.0F, 1605.0F}, // 2号圆环
         {1325.0F, 1370.0F, 1220.0F}, // 3号圆环
-        // {2226.0F, 1325.0F, 760.0F},  // 1号圆环
-        // {1823.0F, 1360.0F, 1605.0F}, // 2号圆环
-        // {1330.0F, 1400.0F, 1225.0F}, // 3号圆环
+        // {2224.0F, 1325.0F, 760.0F},  // 1号圆环
+        // {1823.0F, 1350.0F, 1605.0F}, // 2号圆环
+        // {1320.0F, 1370.0F, 1245.0F}, // 3号圆环
 
     };
 
@@ -258,5 +266,8 @@ namespace mechanism_config
     constexpr uint32_t STEPPER_QUERY_RESPONSE_TIMEOUT_MS = 100;
     // 单个步进动作从下发到确认到位的总超时（ms），超时则机构报故障，防止卡死。
     constexpr uint32_t STEPPER_TIMEOUT_MS = 15000;
+    // 放置圆环的升降/伸缩/底座步骤：下发后超过该时间仍未收到到位或堵转反馈，
+    // 视为已顶到位，停止该电机并按到位处理，不报超时故障。
+    constexpr uint32_t RING_PLACEMENT_ARRIVAL_TIMEOUT_MS = 5000;
 
 } // namespace mechanism_config

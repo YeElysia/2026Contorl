@@ -80,6 +80,13 @@ public:
     bool prepareForTravel(
         TravelDestination destination) override;
 
+    /**
+     * @brief 让机构回到上电初始位（与begin()相同的初始化动作）。
+     *
+     * 仅在机构已就绪且空闲时接受；完成后result()为Succeeded。
+     */
+    bool returnToInitialPose();
+
     bool start(
         StationTask task,
         uint8_t round,
@@ -119,7 +126,6 @@ private:
         RotateStorage,
         OpenGripper,
         OpenGripperMax,
-        CloseGripperUnloaded,
         CloseGripper,
         CloseGripperGrasp
     };
@@ -136,6 +142,7 @@ private:
         uint32_t queryStartedMs;
         uint8_t faultFeedbackCount;
         uint8_t onPositionFeedbackCount;
+        bool stallIsArrival;
     };
 
     enum class TaskPhase : uint8_t
@@ -186,6 +193,7 @@ private:
     uint8_t _nextStepGroup = 0;
     TTL_Stepper *_sharedPollOwner = nullptr;
     uint32_t _lastSharedBusPollMs = 0;
+    uint32_t _sharedPollOwnerSinceMs = 0;
     uint32_t _alignmentStartedMs = 0;
     uint32_t _lastObservationMs = 0;
     uint32_t _alignmentObservationAfterMs = 0;
@@ -206,6 +214,7 @@ private:
     bool _pickupTargetSeen = false;
     bool _storageToRoughFastProfile = false;
     bool _pickupToTrayFastProfile = false;
+    bool _secondLayerFastBase = false;
     bool _roughPlacementCalibrationActive = false;
     uint16_t _roughPlacementCalibrationSpeed = 0;
     uint8_t _roughPlacementCalibrationAcceleration = 0;
@@ -242,7 +251,8 @@ private:
         float baseTarget,
         float liftTarget,
         float extensionTarget,
-        int8_t storageSlotToPrepare = -1);
+        int8_t storageSlotToPrepare = -1,
+        bool placementStallIsArrival = false);
     void addRoughRingToTrayRetraction(uint8_t ring);
     void addStorageDeposit(
         bool liftAfterDeposit = true,
@@ -275,7 +285,8 @@ private:
     void loadRingToStorageAction(
         uint8_t traySlot,
         const mechanism_config::RingPose &pose,
-        bool directRingSwitch = false);
+        bool directRingSwitch = false,
+        bool rotateTrayFirst = false);
 
     bool updateCurrentStep();
     bool updateActionStep(ActionStep &step);
